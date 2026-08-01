@@ -6,23 +6,23 @@ import (
 	"time"
 )
 
-// stoppableListener 是可通过 stopc 中断 Accept 的 TCP 监听器。
+// stoppableListener 为 Raft HTTP 服务提供可取消的 TCP Accept。
 //
-// 普通 net.TCPListener.Accept 会一直阻塞到新连接到达或监听器关闭。这里把
-// AcceptTCP 放进 goroutine，并同时等待 stopc，使 Raft HTTP 服务可以响应节点
-// 关闭信号；成功建立的连接还会启用 TCP keep-alive。
+// net.TCPListener.AcceptTCP 本身不能同时等待外部通道，因此 Accept 使用辅助协程
+// 接收连接，并在调用方关闭 stopc 时主动返回。每个成功连接都会启用 TCP keep-alive，
+// 以便传输层最终发现已经失效的对等节点连接。
 type stoppableListener struct {
-	// 嵌入 TCPListener，使 stoppableListener 复用 Close、Addr 和 AcceptTCP。
+	// 嵌入监听器以复用 net.Listener 所需的 Close 和 Addr 方法。
 	*net.TCPListener
 
-	// stopc 只用于接收关闭信号；通常由拥有者通过 close(stopc) 广播停止。
+	// stopc 由 Raft 节点关闭，用于广播网络服务停止事件。
 	stopc <-chan struct{}
 }
 
-// newStoppableListener 在 addr 上创建 TCP 监听器，并绑定外部停止信号。
+// newStoppableListener 监听 addr，并将底层 TCP 监听器与 stopc 组合。
 //
-// 例如 addr="127.0.0.1:12380" 只监听本机回环地址；addr=":12380" 则监听
-// 所有可用网络接口。由于 network 固定为 "tcp"，成功结果可以断言为 *net.TCPListener。
+// 例如 "127.0.0.1:9021" 仅接受本机连接，而 ":9021" 接受所有网络接口上的连接。
+// network 固定为 tcp，因此 net.Listen 成功后返回值的具体类型是 *net.TCPListener。
 func newStoppableListener(addr string, stopc <-chan struct{}) (*stoppableListener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -31,17 +31,17 @@ func newStoppableListener(addr string, stopc <-chan struct{}) (*stoppableListene
 	return &stoppableListener{ln.(*net.TCPListener), stopc}, nil
 }
 
-// Accept 等待一个新 TCP 连接、底层监听错误或停止信号三者之一。
+// Accept 实现 net.Listener，并等待连接、监听错误或 stopc 三类事件中的第一个。
 //
-// 该签名实现 net.Listener。内部结果通道容量为 1，保证外层因 stopc 返回后，
-// AcceptTCP goroutine 即使稍后结束，也能写入结果并退出，不会再因无人接收而阻塞。
+// 两个结果通道都带一个缓冲。这样即使 stopc 先触发、Accept 已经返回，仍在
+// AcceptTCP 中阻塞的协程也能在监听器随后关闭时投递结果并退出。
 func (ln stoppableListener) Accept() (c net.Conn, err error) {
-	// 连接和错误分开传递，便于 select 明确区分成功与失败。
+	// 分离成功连接和错误，使 select 的每个分支保持单一含义。
 	connc := make(chan *net.TCPConn, 1)
 	errc := make(chan error, 1)
 
 	go func() {
-		// AcceptTCP 本身不可直接选择 stopc，因此放入辅助 goroutine。
+		// 将不可取消的 AcceptTCP 转成可参与 select 的结果通道。
 		tc, err := ln.AcceptTCP()
 		if err != nil {
 			errc <- err
@@ -51,14 +51,12 @@ func (ln stoppableListener) Accept() (c net.Conn, err error) {
 	}()
 	select {
 	case <-ln.stopc:
-		// net/http.Server.Serve 收到此错误后会结束服务并关闭监听器，进而唤醒仍在
-		// AcceptTCP 中等待的辅助 goroutine。
+		// Serve 收到非 nil 错误后结束；上层关闭监听器会解除辅助协程的 AcceptTCP。
 		return nil, errors.New("server stopped")
 	case err := <-errc:
 		return nil, err
 	case tc := <-connc:
-		// keep-alive 用于发现长时间无业务流量但对端已经异常断开的 Raft 连接。
-		// 3 分钟是探测间隔，不是应用层请求超时。
+		// 三分钟是 TCP keep-alive 探测周期，并不限制一次 Raft HTTP 请求的执行时间。
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(3 * time.Minute)
 		return tc, nil

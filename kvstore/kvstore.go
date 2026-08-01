@@ -2,174 +2,451 @@ package kvstore
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
-	"strings"
+	"sort"
 	"sync"
 
 	"go.etcd.io/etcd/server/v3/etcdserver/api/snap"
+	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 )
 
-// kvstore 是由 Raft 已提交日志驱动的内存键值状态机。
-//
-// 所有节点只要以相同顺序应用相同的 kv 命令，就会得到相同的 kvStore 内容。
-// 业务写入不能直接修改 map，而必须先经 proposeC 提交给 Raft；读取则访问本节点
-// 当前已经应用的状态，因此它不天然等价于一次经过 Leader 确认的线性一致读。
-type kvstore struct {
-	// proposeC 把序列化后的写命令发送给 Raft 提案流程。
-	proposeC chan<- string
+var (
+	// ErrNotFound 表示目标键在指定版本不存在或当时已被删除。
+	ErrNotFound = errors.New("key not found at revision")
+	// ErrFutureRevision 表示查询版本大于本节点当前已经应用的逻辑版本。
+	ErrFutureRevision = errors.New("requested revision is in the future")
+	// ErrWriteOutcomeUnknown 表示上下文取消时命令可能已经进入 Raft，调用方无法据此
+	// 判断写入最终会提交还是失败；重试前应查询状态或使用业务幂等键去重。
+	ErrWriteOutcomeUnknown = errors.New("write outcome unknown")
+)
 
-	// mu 保护 kvStore。状态机应用日志、HTTP 查询和快照序列化可能并发发生，
-	// 因而所有 map 访问都必须持锁，避免 Go map 的并发读写错误。
+// kvstore 是保存完整键历史的 Raft 复制状态机。
+//
+// 写操作先编码为 command 并经 proposeC 进入 Raft，只有已提交日志才会修改 kvStore。
+// 相同命令序列会在所有节点生成相同的 revision 和历史。LookupLocal 不执行共识读取；
+// 当 Follower 尚未追上提交位置时，它返回的可能是较旧状态。
+type kvstore struct {
+	// proposeC 传递普通业务命令；readIndexC 传递一致性读取屏障请求。
+	proposeC   chan<- *proposal
+	readIndexC chan<- *readIndexRequest
+
+	// mu 串行化历史查询、日志应用、快照生成和快照恢复。
 	mu sync.Mutex
 
-	// kvStore 保存本节点已经应用的键值状态。
-	kvStore map[string]string
+	// kvStore 保存每个键按版本排列的记录；curRevision 是全局最新逻辑版本。
+	kvStore     map[string]value
+	curRevision revision
 
-	// snapshotter 用于读取 Raft 层已经持久化的完整业务快照。
+	// 两个 inflight 表分别关联写命令应用回执和 ReadIndex 完成信号。
+	proposalInflight  *proposalInflight
+	readIndexInflight *readIndexInflight
+
+	// snapshotter 从节点的快照目录加载最近持久化的业务状态。
 	snapshotter *snap.Snapshotter
 }
 
-// kv 是写入命令的传输结构，使用 gob 在提案方与状态机之间编码和解码。
+// newKVStore 构造状态机，并在启动日志消费者前恢复最新可用快照。
 //
-// 字段必须导出，否则 encoding/gob 无法编码它们。例如 kv{Key: "name",
-// Val: "alice"} 表示把键 name 更新为 alice。
-type kv struct {
-	Key string
-	Val string
-}
-
-// newKVStore 创建键值状态机，先从已有快照恢复，再异步消费 Raft 提交日志。
-//
-// proposeC 用于发送新写入；commitC 只包含已经被 Raft 提交的命令；errorC 报告
-// 后台 Raft 流程的终止错误。恢复必须先于 readCommits 启动，否则新日志可能先于
-// 快照应用，导致新状态随后被旧快照覆盖。
-func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
+// 该顺序保证恢复基线不会覆盖刚应用的新日志。成功后返回只读错误通道；后台日志
+// 解码、应用或快照恢复失败会写入该通道，正常停止不会写入值。
+func newKVStore(
+	snapshotter *snap.Snapshotter,
+	proposeC chan<- *proposal,
+	readIndexC chan<- *readIndexRequest,
+	commitC <-chan *commit,
+	readStateC <-chan []raft.ReadState,
+) (*kvstore, <-chan error, error) {
 	s := &kvstore{
-		proposeC:    proposeC,
-		kvStore:     make(map[string]string),
-		snapshotter: snapshotter,
+		proposeC:          proposeC,
+		readIndexC:        readIndexC,
+		kvStore:           make(map[string]value),
+		curRevision:       1,
+		proposalInflight:  newProposalInflight(defaultMaxInflight),
+		readIndexInflight: newReadIndexInflight(defaultMaxInflight),
+		snapshotter:       snapshotter,
 	}
 
-	// 这里直接调用 Load，并把包括 snap.ErrNoSnapshot 在内的所有错误都视为致命错误；
-	// 与下方 loadSnapshot 将“无快照”转换为 (nil, nil) 的行为不同。
-	snapshot, err := snapshotter.Load()
+	snapshot, err := s.loadSnapshot()
 	if err != nil {
-		panic(err)
+		return nil, nil, fmt.Errorf("load state machine snapshot: %w", err)
 	}
 
 	if snapshot != nil {
-		// Snapshot.Data 是 getSnapshot 生成的业务 JSON；Metadata 则属于 Raft，
-		// 记录该业务状态对应的日志索引、任期和成员配置。
+		// Data 保存 kvSnap 的 JSON；索引、任期和成员配置位于 Metadata。
 		log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
 		if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
-			log.Panic(err)
+			return nil, nil, fmt.Errorf("restore state machine snapshot: %w", err)
 		}
+		s.readIndexInflight.advanceApplied(snapshot.GetMetadata().GetIndex())
 	}
 
-	// 提交日志在独立 goroutine 中顺序应用，避免构造函数阻塞等待整个节点生命周期。
-	go s.readCommits(commitC, errorC)
+	// readCommits 是状态机的唯一日志消费者，保证所有命令严格按提交顺序执行。
+	applyErrorC := make(chan error, 1)
+	go func() {
+		if err := s.readCommits(commitC); err != nil {
+			applyErrorC <- err
+		}
+	}()
 
-	// 注意：按照构造函数的返回类型和上面的初始化过程，这里通常应返回 s；
-	// 当前代码返回 nil，调用方若直接使用返回值会发生空指针问题。此处仅作说明，
-	// 不在注释任务中改变既有行为。
-	return s
+	go s.readStates(readStateC)
+
+	return s, applyErrorC, nil
 }
 
-// Lookup 返回本节点状态机中 key 当前对应的值，以及该键是否存在。
+// Put 通过 Raft 写入 key 和 val，并等待该命令在本节点完成应用。
+// 返回的 record 是新生成的键版本；上下文在提案进入 Raft 后取消时可能返回
+// ErrWriteOutcomeUnknown。
+func (s *kvstore) Put(
+	ctx context.Context,
+	key, val string,
+) (record, error) {
+	return s.proposeAndWait(ctx, command{
+		CommandType: CommandPut,
+		Key:         key,
+		Val:         val,
+	})
+}
+
+// Delete 通过 Raft 删除 key，并等待本节点应用对应日志。
+// 删除不存在或已经删除的键是成功的无操作，返回零值或现有墓碑，且不推进 revision。
+func (s *kvstore) Delete(
+	ctx context.Context,
+	key string,
+) (record, error) {
+	return s.proposeAndWait(ctx, command{
+		CommandType: CommandDelete,
+		Key:         key,
+	})
+}
+
+// proposeAndWait 为命令分配请求标识、编码并提交，然后等待状态机应用回执。
 //
-// 第二个返回值用于区分“不存在”和“存在但值为空字符串”。例如 ("", false)
-// 表示没有该键，而 ("", true) 表示该键存在且值就是空字符串。
-func (s *kvstore) Lookup(key string) (string, bool) {
+// 取消语义由命令是否已经交给 Raft 决定：入队前取消可确定命令未提交；入队后取消
+// 只能返回 ErrWriteOutcomeUnknown，因为日志仍可能在后台获得多数派确认并被应用。
+func (s *kvstore) proposeAndWait(
+	ctx context.Context,
+	cmd command,
+) (record, error) {
+	requestID, err := newRequestID()
+	if err != nil {
+		return record{}, fmt.Errorf("generate request ID: %w", err)
+	}
+	cmd.RequestID = requestID
+
+	// 序列化发生在注册和提案之前，此处失败时可确定状态机没有接触该命令。
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(cmd); err != nil {
+		return record{}, fmt.Errorf("encode command: %w", err)
+	}
+
+	// 只有可发送的命令才占用有限的回执槽位。
+	applyResultC, err := s.proposalInflight.register(requestID)
+	if err != nil {
+		return record{}, fmt.Errorf("register inflight request: %w", err)
+	}
+	defer s.proposalInflight.remove(requestID, applyResultC)
+
+	// 首个 select 决定命令是否离开调用协程；ctx 分支意味着尚未进入提案通道。
+	proposeResultC := make(chan error, 1)
+	select {
+	case s.proposeC <- &proposal{ctx: ctx, data: buf.String(), resultC: proposeResultC}:
+	case <-ctx.Done():
+		return record{}, ctx.Err()
+	}
+
+	select {
+	case err := <-proposeResultC:
+		if err != nil {
+			return record{}, fmt.Errorf("propose command: %w", err)
+		}
+	case <-ctx.Done():
+		return record{}, fmt.Errorf(
+			"%w: %w",
+			ErrWriteOutcomeUnknown,
+			ctx.Err(),
+		)
+	}
+
+	// Propose 返回成功仍不等于提交成功，必须继续等到 readCommits 投递应用结果。
+	select {
+	case result := <-applyResultC:
+		return unwrapApplyResult(result)
+	case <-ctx.Done():
+		return record{}, fmt.Errorf(
+			"%w: %w",
+			ErrWriteOutcomeUnknown,
+			ctx.Err(),
+		)
+	}
+}
+
+// LookupLinearize 发起 Raft ReadIndex 请求，并在收到进程内完成信号后读取 key。
+// 其设计目标是等到本地应用水位达到 ReadState.Index；最终保证依赖
+// readIndexInflight.maybeSignal 对目标索引与应用索引的比较正确。
+func (s *kvstore) LookupLinearize(ctx context.Context, key string) (record, error) {
+	requestID, err := newRequestID()
+	if err != nil {
+		return record{}, fmt.Errorf("generate request ID: %w", err)
+	}
+
+	sig, err := s.readIndexInflight.register(requestID)
+	if err != nil {
+		return record{}, fmt.Errorf("register inflight request: %w", err)
+	}
+	defer s.readIndexInflight.remove(requestID, sig)
+
+	if err := s.requestReadIndex(ctx, []byte(requestID)); err != nil {
+		return record{}, fmt.Errorf("read index request: %w", err)
+	}
+
+	select {
+	case <-sig:
+		return s.LookupLocal(key)
+	case <-ctx.Done():
+		return record{}, fmt.Errorf("read linearizability timeout: %w", ctx.Err())
+	}
+}
+
+// requestReadIndex 将唯一上下文提交给 raft.Node.ReadIndex，并等待同步调用结果。
+// raft.Node 接受请求后，真正的安全读取索引会异步出现在 Ready.ReadStates 中。
+func (s *kvstore) requestReadIndex(ctx context.Context, requestCtx []byte) error {
+	resultC := make(chan error, 1)
+	req := &readIndexRequest{
+		ctx:        ctx,
+		requestCtx: requestCtx,
+		resultC:    resultC,
+	}
+
+	select {
+	case s.readIndexC <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case err := <-resultC:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// LookupLocal 返回 key 在本节点当前已应用版本上的记录。
+//
+// 空字符串是合法值，因此存在性由 error 判断：写入 key="/x", val="" 后会返回
+// Value 为空且 error 为 nil；不存在或最新记录为墓碑时返回 ErrNotFound。
+func (s *kvstore) LookupLocal(key string) (record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	v, ok := s.kvStore[key]
-	return v, ok
-}
 
-// Propose 把一次键值更新编码为 Raft 提案。
-//
-// 该方法只保证命令已经写入 proposeC，不保证它已经被多数派提交或被本地状态机
-// 应用。例如 Propose("x", "1") 返回后立刻 Lookup("x")，仍可能读到旧值。
-func (s *kvstore) Propose(k string, v string) {
-	// strings.Builder 实现 io.Writer，可直接承接 gob 的二进制编码结果；
-	// Go string 也能保存任意字节，并不要求内容是 UTF-8 文本。
-	var buf strings.Builder
-	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
-		log.Fatal(err)
+	history := s.kvStore[key]
+	if len(history) == 0 {
+		return record{}, ErrNotFound
 	}
 
-	// 若 Raft 提案消费者尚未启动且通道没有缓冲，此发送会阻塞，从而形成自然背压。
-	s.proposeC <- buf.String()
+	latest := history[len(history)-1]
+	if latest.Deleted {
+		return record{}, ErrNotFound
+	}
+	return *latest, nil
 }
 
-// readCommits 按 Raft 提交顺序执行命令，并在每个批次完成后通知提交方。
+// LookupAtRevision 查询 key 在 target 版本时可见的最后一条记录。
 //
-// commitC 中的 nil 是控制信号，不是空命令：它要求状态机重新加载磁盘快照。
-// 非 nil commit 的 data 必须保持原有顺序；批次全部执行后关闭 applyDoneC，
-// Raft 层才能安全地以最新业务状态制作快照。
-func (s *kvstore) readCommits(commitC <-chan *commit, errorC <-chan error) {
+// NoneRevision 等价于当前版本。历史通过二分查找定位第一个 ModRevision 大于 target
+// 的记录，再取其前一项。例如修改版本依次为 2、5、9，查询版本 7 会返回版本 5；
+// 若该记录是墓碑，则返回 ErrNotFound。
+func (s *kvstore) LookupAtRevision(key string, target revision) (record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if target == NoneRevision {
+		target = s.curRevision
+	}
+
+	if target > s.curRevision {
+		return record{}, ErrFutureRevision
+	}
+
+	history := s.kvStore[key]
+	if len(history) == 0 {
+		return record{}, ErrNotFound
+	}
+
+	index := sort.Search(len(history), func(i int) bool { return history[i].ModRevision > target })
+	if index == 0 {
+		return record{}, ErrNotFound
+	}
+
+	rec := history[index-1]
+	if rec.Deleted {
+		return record{}, ErrNotFound
+	}
+	return *rec, nil
+}
+
+// readCommits 顺序消费已提交日志，并在每批业务命令应用完成后关闭 applyDoneC。
+//
+// nil 批次是远端快照已经持久化的控制消息，要求状态机整体重新加载快照。非 nil
+// 批次中的 data 按 Raft 日志顺序执行；关闭完成通道后，Raft 层才能确信对应业务
+// 状态可用于制作索引一致的快照。
+func (s *kvstore) readCommits(commitC <-chan *commit) error {
 	for commit := range commitC {
 		if commit == nil {
-			// Raft 层接收到远端快照后会发送 nil，通知业务状态机用快照整体替换
-			// 当前 map。快照加载完成后继续消费其后的增量日志。
-			snapshot, err := s.snapshotter.Load()
+			// 快照是完整状态替换；恢复完成后再继续应用后续增量日志。
+			snapshot, err := s.loadSnapshot()
 			if err != nil {
-				log.Panic(err)
+				return fmt.Errorf("reload state machine snapshot: %w", err)
 			}
 
 			if snapshot != nil {
 				log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
 				if err := s.recoverFromSnapshot(snapshot.GetData()); err != nil {
-					log.Panic(err)
+					return fmt.Errorf("restore published state machine snapshot: %w", err)
 				}
 			}
+			s.readIndexInflight.advanceApplied(snapshot.GetMetadata().GetIndex())
 			continue
 		}
 
 		for _, data := range commit.data {
-			// 每个 data 都应是 Propose 中 gob 编码的一条 kv 命令。任何解码失败
-			// 都表示复制日志中的业务载荷不符合协议，跳过会造成节点状态不一致。
-			var dataKv kv
+			// 已提交载荷无法解码属于状态机协议错误；跳过它会让节点产生不同状态。
+			var command command
 			dec := gob.NewDecoder(bytes.NewBufferString(data))
-			if err := dec.Decode(&dataKv); err != nil {
-				log.Fatalf("kvstore: could not decode message (%v)", err)
+			if err := dec.Decode(&command); err != nil {
+				return fmt.Errorf("decode committed state machine command: %w", err)
 			}
 
-			s.mu.Lock()
-			s.kvStore[dataKv.Key] = dataKv.Val
-			s.mu.Unlock()
+			if err := s.apply(command); err != nil {
+				return err
+			}
 		}
+		s.readIndexInflight.advanceApplied(commit.raftLogIndex)
 
-		// close 用作一次性广播：所有等待该批次完成的接收者都会立即被唤醒。
-		// 每个 applyDoneC 只能关闭一次，因此其所有权属于此状态机消费流程。
+		// 完成通道由状态机独占关闭；close 可同时唤醒所有等待该批次的协程。
 		close(commit.applyDoneC)
 	}
+	return nil
+}
 
-	// commitC 关闭表示不会再有已提交日志。随后读取 errorC，以区分正常关闭与
-	// Raft 后台错误；若 errorC 已正常关闭，则 ok 为 false，不执行 Fatal。
-	if err, ok := <-errorC; ok {
-		log.Fatal(err)
+// readStates 消费 Ready.ReadStates，并把每个请求标识对应的安全读取索引写入等待堆。
+func (s *kvstore) readStates(readStateC <-chan []raft.ReadState) {
+	for states := range readStateC {
+		for _, state := range states {
+			s.readIndexInflight.updateReadIndex(string(state.RequestCtx), state.Index)
+		}
 	}
 }
 
-// getSnapshot 在持锁状态下把整个键值状态机序列化为 JSON。
-//
-// 锁保证快照对应一个一致时刻。例如并发写入 x 和 y 时，不会得到只包含某次
-// map 修改一半的状态。返回的字节会被放入 raftpb.Snapshot.Data。
-func (s *kvstore) getSnapshot() ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return json.Marshal(s.kvStore)
+// apply 将一条已提交命令分派给确定性的状态转换，并完成原始写请求的回执。
+// 未知命令类型不能被忽略，否则不同版本的节点可能悄然产生分歧。
+func (s *kvstore) apply(cmd command) error {
+	switch cmd.CommandType {
+	case CommandPut:
+		rec := s.applyPut(cmd.Key, cmd.Val)
+		s.proposalInflight.complete(cmd.RequestID, &applyResult{
+			record: rec,
+			err:    nil,
+		})
+		return nil
+	case CommandDelete:
+		rec := s.applyDelete(cmd.Key)
+		s.proposalInflight.complete(cmd.RequestID, &applyResult{
+			record: rec,
+			err:    nil,
+		})
+		return nil
+
+	default:
+		return fmt.Errorf("apply unknown command type %d", cmd.CommandType)
+	}
 }
 
-// loadSnapshot 读取最新业务快照，并把“尚无快照”规范化为 (nil, nil)。
+// applyPut 追加一个写入版本并推进全局 revision。
+// 首次写入从 Version=1 开始；后续写入（包括墓碑后的再次写入）沿用最初的
+// CreateRevision，并在上一条记录基础上递增 Version。
+func (s *kvstore) applyPut(key, val string) record {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.curRevision++
+	rev := s.curRevision
+	history := s.kvStore[key]
+	var rec record
+	if len(history) == 0 {
+		rec = record{
+			Value:          val,
+			CreateRevision: rev,
+			ModRevision:    rev,
+			Version:        1,
+			Deleted:        false,
+		}
+	} else {
+		previous := history[len(history)-1]
+		rec = record{
+			Value:          val,
+			CreateRevision: previous.CreateRevision,
+			ModRevision:    rev,
+			Version:        previous.Version + 1,
+			Deleted:        false,
+		}
+	}
+	s.kvStore[key] = append(history, &rec)
+
+	return rec
+}
+
+// applyDelete 为现存键追加墓碑并推进 revision。
+// 对从未存在或最新版本已经是墓碑的键重复删除不会生成新历史记录。
+func (s *kvstore) applyDelete(key string) record {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	history := s.kvStore[key]
+	if len(history) == 0 {
+		return record{}
+	}
+
+	previous := history[len(history)-1]
+	if previous.Deleted {
+		return *previous
+	}
+
+	s.curRevision++
+	rev := s.curRevision
+	tombstone := record{
+		Value:          "",
+		CreateRevision: previous.CreateRevision,
+		ModRevision:    rev,
+		Version:        previous.Version + 1,
+		Deleted:        true,
+	}
+	s.kvStore[key] = append(history, &tombstone)
+	return tombstone
+}
+
+// getSnapshot 在同一个临界区内将当前 revision 和全部键历史编码为 JSON。
 //
-// 调用方应同时检查 snapshot 和 err：nil snapshot 加 nil error 表示正常首次启动，
-// 非 nil error 才表示快照文件损坏或底层 I/O 失败。
+// 锁覆盖 json.Marshal，而不只是复制 map 头；否则并发追加历史时可能得到版本号与
+// 数据不匹配的快照。结果由 Raft 层写入 raftpb.Snapshot.Data。
+func (s *kvstore) getSnapshot() ([]byte, error) {
+	s.mu.Lock()
+	kvsnap := &kvSnap{
+		CurRevision: s.curRevision,
+		KvStore:     s.kvStore,
+	}
+	defer s.mu.Unlock()
+	return json.Marshal(kvsnap)
+}
+
+// loadSnapshot 从 snapshotter 读取最新快照，并把首次启动时的 ErrNoSnapshot 转换为
+// nil 快照和 nil 错误。
+//
+// 其他错误保留给调用方处理，因为损坏文件或读取失败都不能安全地退化为空状态启动。
 func (s *kvstore) loadSnapshot() (*raftpb.Snapshot, error) {
 	snapshot, err := s.snapshotter.Load()
 	if errors.Is(err, snap.ErrNoSnapshot) {
@@ -183,19 +460,19 @@ func (s *kvstore) loadSnapshot() (*raftpb.Snapshot, error) {
 	return snapshot, nil
 }
 
-// recoverFromSnapshot 用 JSON 快照整体替换当前键值状态。
+// recoverFromSnapshot 解析 kvSnap，并以其中的版本和历史整体替换内存状态。
 //
-// 先在锁外反序列化可以缩短临界区；只有解析成功后才加锁替换 map，因此损坏快照
-// 不会破坏当前仍可用的内存状态。例如 {"x":"1"} 会恢复为只包含 x=1 的新 map，
-// 而不是与旧 map 做增量合并。
+// JSON 在加锁前完成校验，因此解析失败不会破坏当前状态。成功恢复采用替换而非合并：
+// 若快照仅包含键 a，则旧内存中不在快照内的键 b 会被移除。
 func (s *kvstore) recoverFromSnapshot(snapshot []byte) error {
-	var store map[string]string
-	if err := json.Unmarshal(snapshot, &store); err != nil {
+	var kvsnap kvSnap
+	if err := json.Unmarshal(snapshot, &kvsnap); err != nil {
 		return err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.kvStore = store
+	s.kvStore = kvsnap.KvStore
+	s.curRevision = kvsnap.CurRevision
 	return nil
 }

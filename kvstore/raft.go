@@ -1,4 +1,4 @@
-// Package kvstore 实现一个由 Raft 复制日志驱动的键值存储。
+// Package kvstore 提供基于 etcd/raft 的版本化内存键值状态机及其 HTTP 服务。
 package kvstore
 
 import (
@@ -25,145 +25,118 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// commit 表示一批已经由 Raft 集群确认、等待应用到本地状态机的日志数据。
+// raftNode 负责把 etcd/raft 协议状态机连接到持久化、业务应用和节点间传输。
 //
-// “已提交”只说明多数派已经确认这些日志，不代表本地键值状态机已经执行完毕。
-// 例如，data 中依次包含“设置 x=1”和“设置 x=2”时，状态机必须按切片顺序执行，
-// 最终 x 才会等于 2；全部执行成功后，再通过 applyDoneC 通知 Raft 处理流程。
-type commit struct {
-	// data 保存待应用命令的编码结果，元素顺序与 Raft 日志的提交顺序一致。
-	data []string
-
-	// applyDoneC 用于通知提交方：data 已全部应用到状态机。
-	//
-	// 这里使用 chan<- 限定 commit 的使用者只能发送或关闭通道，不能从中接收。
-	// 当前状态机通过 close(applyDoneC) 完成通知；关闭通道还能同时唤醒所有等待者。
-	applyDoneC chan<- struct{}
-}
-
-// raftNode 封装单个 Raft 成员运行所需的通信通道、持久化状态和网络组件。
-//
-// raft.Node 只负责 Raft 协议状态机；业务命令的执行、WAL 与快照的落盘，以及节点间
-// 消息传输，均由 raftNode 周边组件完成。把这些状态集中在此处，可以保证日志提交、
-// 应用和快照截断使用同一组索引。
+// raft.Node 产生 Ready，但不会替应用程序写 WAL、发送消息或执行业务命令；这些工作
+// 由 raftNode 按安全顺序完成。该类型还集中维护 appliedIndex、snapshotIndex 和
+// ConfState，使日志发布与快照压缩使用一致的进度基准。
 type raftNode struct {
-	// proposeC 接收上层提交的业务命令。命令进入此通道不等于已经提交，
-	// 只有 Raft 达成多数派共识后，它才会经 commitC 交给状态机执行。
-	proposeC <-chan string
+	// proposeC 接收普通业务提案；只有随后出现在 CommittedEntries 中的命令才会应用。
+	proposeC <-chan *proposal
 
-	// confChangC 接收成员增删等集群配置变更。配置变更也必须作为 Raft 日志复制，
-	// 不能直接修改 peers 或 confState，否则不同节点可能看到不一致的成员关系。
-	confChangC <-chan *raftpb.ConfChange
+	// confChangC 接收成员配置提案，字段名沿用项目中的既有拼写。
+	confChangC <-chan *confChangeProposal
 
-	// commitC 按日志顺序向业务状态机输出已经提交的命令批次。
+	// readIndexC 输入一致性读取屏障；readStatesC 输出 Raft 确认的读取索引。
+	readIndexC  <-chan *readIndexRequest
+	readStatesC chan<- []raft.ReadState
+
+	// commitC 把已提交业务命令或 nil 快照重载信号发送给 kvstore。
 	commitC chan<- *commit
 
-	// errorC 向上层报告 Raft 后台流程中无法自行恢复的异步错误。
+	// errorC 是 Raft 后台生命周期的最终错误和完成通知通道。
 	errorC chan<- error
 
-	// id 是当前成员在 Raft 集群中的唯一编号。
+	// id 是从 1 开始的本节点成员 ID。
 	id int
 
-	// peers 保存集群成员的 Raft HTTP 地址，用于初始化节点间通信。
-	// 例如，三个本地成员可以使用不同端口的三个 http://127.0.0.1:<port> 地址。
+	// peers 按成员 ID 顺序保存 Raft HTTP 地址，即 peers[id-1] 属于成员 id。
 	peers []string
 
-	// join 表示当前成员是否加入一个已经存在的集群；false 通常表示按初始成员列表
-	// 启动新集群，true 则不能再次把初始成员提议为一套新的集群配置。
+	// join 为 true 时按已有状态重启节点，不用 peers 引导新的初始配置。
 	join bool
 
-	// waldir 是预写日志（WAL）目录。WAL 用于在进程重启后恢复尚未被快照覆盖的日志。
+	// waldir 保存 HardState 和日志增量。
 	waldir string
 
-	// snapdir 是快照目录。快照保存某一日志索引处完整的业务状态机数据。
+	// snapdir 保存带 Raft 元数据的完整业务快照。
 	snapdir string
 
-	// getSnapshot 在制作快照时序列化当前业务状态机。
-	// 返回值只包含业务数据；快照的日志索引、任期和成员配置由 Raft 元数据提供。
+	// getSnapshot 获取业务数据；CreateSnapshot 负责补充索引、任期和成员配置。
 	getSnapshot func() ([]byte, error)
 
-	// confState 是最近一次已应用配置变更产生的成员状态，制作快照时需要把它写入
-	// Snapshot.Metadata，以便节点仅凭快照也能恢复当时的集群成员关系。
+	// confState 是最近应用的成员配置，也是生成/发送快照时的成员关系基准。
 	confState *raftpb.ConfState
 
-	// snapshotIndex 是最近一次成功持久化的快照所覆盖的最大日志索引。
+	// snapshotIndex 是最近一次完成快照流程的日志索引。
 	snapshotIndex uint64
 
-	// appliedIndex 是当前处理流程已经推进到的最大已提交日志索引。
+	// appliedIndex 是 publishEntries 已处理到的最大提交索引。
 	//
-	// appliedIndex 与 snapshotIndex 不同：前者描述“已经执行到哪里”，后者描述
-	// “已经持久化到哪里”。例如 snapshotIndex=100、appliedIndex=120 表示状态机已
-	// 执行到 120，但当前快照只覆盖到 100；下一次快照可把 101～120 一并纳入。
-	//
-	// publishEntries 会先把普通日志交给业务状态机，再把此字段推进到批次末尾；
-	// 当 publishEntries 返回的完成通道非 nil 时，调用方仍需等待该通道关闭，才能
-	// 把此索引当作业务状态已经真正执行完毕的边界。
+	// 它可领先 snapshotIndex，例如 appliedIndex=125、snapshotIndex=100 表示日志已经
+	// 发布到 125，而磁盘快照只覆盖到 100。普通日志刚发送至 commitC 时该字段就会
+	// 前移；若需要立即制作快照，仍须等待对应 applyDoneC 关闭。
 	appliedIndex uint64
 
-	// node 是 etcd/raft 提供的异步协议状态机句柄，用于提交提案、处理网络消息，
-	// 并读取包含待持久化日志和已提交日志的 Ready。
+	// node 是异步 Raft 协议句柄，负责提案、Step、Ready 和逻辑时钟。
 	node raft.Node
 
-	// raftStorage 保存 Raft 算法运行时需要读取的日志、HardState 和快照。
-	// 它是内存存储，不替代 WAL；重启时仍需从磁盘快照和 WAL 重建其中的内容。
+	// raftStorage 是运行期日志视图；它不提供进程重启后的持久性。
 	raftStorage *raft.MemoryStorage
 
-	// wal 是已打开的预写日志，用于持久化 HardState、日志条目和快照检查点。
+	// wal 持久化 Raft HardState、日志和快照检查点。
 	wal *wal.WAL
 
-	// snapshotter 负责将完整的 raftpb.Snapshot 写入 snapdir 或从中加载。
+	// snapshotter 在 snapdir 中校验、读取和写入完整快照文件。
 	snapshotter *snap.Snapshotter
 
-	// snapshotterReady 在快照组件初始化完成后将其发布给依赖方，避免依赖方在
-	// snapdir 尚未准备好时读取快照。
-	snapshotterReady chan *snap.Snapshotter
+	// httpErrorC 将节点间 HTTP 服务的意外退出报告给主循环。
+	httpErrorC chan error
 
-	// snapCount 是触发周期性快照的已应用日志数量阈值。
-	// 例如上次快照索引为 100、snapCount 为 10 时，累计应用约 10 条新日志后，
-	// 快照检查逻辑便可决定是否制作新快照；具体是否包含临界值由调用处的比较条件决定。
+	// snapCount 是 appliedIndex 与 snapshotIndex 允许累积的差值阈值。
 	snapCount uint64
 
-	// transport 负责通过 HTTP 向其他 Raft 成员收发协议消息。
+	// transport 通过 rafthttp 与其他成员交换协议消息和快照。
 	transport *rafthttp.Transport
 
-	// stopc 用于请求停止 Raft 主处理流程。
+	// stopc 关闭后停止 Raft 主循环及可能阻塞的内部发送。
 	stopc chan struct{}
 
-	// httpstopc 用于请求停止 Raft HTTP 服务。
+	// httpstopc 请求停止节点间 HTTP 服务。
 	httpstopc chan struct{}
 
-	// httpdonec 在 Raft HTTP 服务完全退出后发出确认，使关闭流程可以等待网络资源
-	// 释放完毕，而不是在发出停止请求后立即返回。
+	// httpdonec 在 HTTP Serve 协程退出时关闭，供资源回收流程等待。
 	httpdonec chan struct{}
 }
 
-// defaultSnapshotCount 是两次快照之间允许累计的已应用日志条数。
+// defaultSnapshotCount 是尝试生成相邻快照前允许累积的日志索引差。
 //
-// 默认 10000 表示在上次快照后新增日志超过约一万条时尝试制作新快照。它控制
-// 快照频率，不等同于快照后在内存中保留多少条日志；后者由 snapshotCatchUpEntriesN
-// 单独控制。
+// 当前比较条件是“严格大于”，因此从索引 100 的快照开始，阈值为 10000 时要等到
+// appliedIndex 超过 10100 才触发。该值只决定快照频率，不决定压缩后保留的日志量。
 var defaultSnapshotCount uint64 = 10000
 
-// newRaftNode 构造并异步启动一个 Raft 成员。
+// newRaftNode 完成磁盘恢复、协议节点创建和 Raft HTTP 监听后再返回。
 //
-// 返回的三个只读通道分别用于：
-//   - commitC：向业务状态机发布已提交命令或 nil 快照重载信号；
-//   - errorC：报告 Raft 后台不可恢复错误；
-//   - snapshotterReady：发布初始化完成的快照读写器。
-//
-// id 按当前实现从 1 开始，并与 peers 中的顺序对应。例如 peers[0] 属于节点 1，
-// peers[1] 属于节点 2。join=true 表示加入或重启现有集群，不使用 peers 再次引导
-// 一套新的初始成员配置。
-func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string, confChangeC <-chan *raftpb.ConfChange) (<-chan *commit, <-chan error, <-chan *snap.Snapshotter) {
-	// 无缓冲通道让 Raft 发布流程与状态机消费形成背压，避免无限堆积提交批次。
+// commitC 发布已提交业务批次（nil 表示重载快照），readStatesC 发布 ReadIndex 结果，
+// errorC 报告后台最终错误，snapshotter 供状态机加载同一快照目录。成员 ID 必须能
+// 映射到 peers[id-1]；例如 id=2 使用第二个地址作为本地 Raft 监听地址。
+func newRaftNode(
+	id int, peers []string, join bool,
+	getSnapshot func() ([]byte, error),
+	proposeC <-chan *proposal,
+	confChangeC <-chan *confChangeProposal,
+	readIndexC <-chan *readIndexRequest,
+) (<-chan *commit, <-chan []raft.ReadState, <-chan error, *snap.Snapshotter, error) {
+	// 无缓冲提交通道让 Raft 发布速度受状态机接收速度约束。
 	commitC := make(chan *commit)
-	errorC := make(chan error)
-
-	// WAL 和快照目录是相对于进程当前工作目录的节点专属目录。例如 id=2 时分别为
-	// kvstore-2 与 kvstore-2-snap，避免同一环境中的不同成员互相覆盖数据。
+	errorC := make(chan error, 1)
+	readStatesC := make(chan []raft.ReadState)
+	// 每个成员使用独立的相对目录；id=2 对应 kvstore-2/ 和 kvstore-2-snap/。
 	rc := raftNode{
 		proposeC:    proposeC,
 		confChangC:  confChangeC,
+		readIndexC:  readIndexC,
+		readStatesC: readStatesC,
 		commitC:     commitC,
 		errorC:      errorC,
 		id:          id,
@@ -173,342 +146,401 @@ func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 		snapdir:     fmt.Sprintf("kvstore-%d-snap", id),
 		getSnapshot: getSnapshot,
 
-		snapCount: defaultSnapshotCount,
-		stopc:     make(chan struct{}),
-		httpstopc: make(chan struct{}),
-		httpdonec: make(chan struct{}),
+		snapCount:  defaultSnapshotCount,
+		stopc:      make(chan struct{}),
+		httpstopc:  make(chan struct{}),
+		httpdonec:  make(chan struct{}),
+		httpErrorC: make(chan error, 1),
 	}
 
-	// 注意：snapshotterReady 字段当前未在结构体字面量中 make。nil 通道既不能
-	// 发送也不能接收，startRaft 发布 snapshotter 时会永久阻塞；这里保留现有实现。
-	// 正常设计应在启动 goroutine 前初始化该通道。
-	go rc.startRaft()
-	return commitC, errorC, rc.snapshotterReady
+	if err := rc.startRaft(); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return commitC, readStatesC, errorC, rc.snapshotter, nil
 }
 
-// saveSnap 按“快照文件、WAL 快照检查点、释放旧 WAL 锁”的顺序持久化快照。
+// saveSnap 依次保存完整快照、WAL 检查点并释放已覆盖 WAL 段的锁。
 //
-// WAL 中的 walpb.Snapshot 只记录索引、任期和成员配置，不包含业务状态数据；
-// 完整数据由 snapshotter 写入独立的快照文件。先写快照文件再写 WAL 检查点很重要：
-// 即使写 WAL 失败，磁盘上最多留下一个尚未被 WAL 引用的快照；反过来则可能让恢复
-// 流程读到一个找不到对应快照文件的检查点。
+// walpb.Snapshot 只是 Index、Term 和 ConfState 组成的恢复锚点，业务 Data 位于独立
+// 快照文件。文件必须先于检查点落盘：若第二步失败，只会留下一个未被 WAL 认可的
+// 孤儿文件；若顺序相反，恢复过程可能找到一个没有完整数据的有效检查点。
 //
-// 例如快照覆盖到索引 120、任期为 7 时，快照文件保存索引 120 时的键值数据，
-// WAL 检查点保存 {Index: 120, Term: 7, ConfState: ...}。重启恢复时先加载该快照，
-// 再重放索引大于 120 的 WAL 日志，无需从第一条日志重新执行。
+// 例如 Index=120、Term=7 的快照保存截至日志 120 的键历史，WAL 只记录对应定位
+// 信息；重启后加载该文件，再重放 120 之后的日志。
 func (rc *raftNode) saveSnap(snap *raftpb.Snapshot) error {
-	// 从完整快照中提取 WAL 恢复定位所需的最小元数据。
+	// WAL 标记不复制可能较大的业务 Data。
 	walSnap := &walpb.Snapshot{
 		Index:     snap.GetMetadata().Index,
 		Term:      snap.GetMetadata().Term,
 		ConfState: snap.GetMetadata().ConfState,
 	}
 
-	// 先保证完整快照已经落盘，再让 WAL 声明该快照可用于恢复。
+	// 只有完整文件成功写入后，才发布对应的 WAL 恢复锚点。
 	if err := rc.snapshotter.SaveSnap(snap); err != nil {
-		return err
+		return fmt.Errorf("save snapshot file at index %d: %w", snap.GetMetadata().GetIndex(), err)
 	}
 
 	if err := rc.wal.SaveSnapshot(walSnap); err != nil {
-		return err
+		return fmt.Errorf("save WAL snapshot marker at index %d: %w", walSnap.GetIndex(), err)
 	}
 
-	// 快照和检查点均保存成功后，旧 WAL 段才不再需要一直持有文件锁；
-	// 后续清理流程可以据此回收已被快照覆盖的历史 WAL 文件。
-	return rc.wal.ReleaseLockTo(snap.GetMetadata().GetIndex())
+	// 两类数据均持久化后，快照索引之前的 WAL 文件才具备安全回收条件。
+	if err := rc.wal.ReleaseLockTo(snap.GetMetadata().GetIndex()); err != nil {
+		return fmt.Errorf("release WAL lock through index %d: %w", snap.GetMetadata().GetIndex(), err)
+	}
+	return nil
 }
 
-// entriesToApply 从一批已提交日志中剔除本节点已经应用过的前缀。
+// entriesToApply 返回 CommittedEntries 中尚未发布的连续后缀。
 //
-// Raft 的 Ready 可能再次携带一部分已经处理过的日志，因此不能直接重复应用整个
-// ents，否则“账户余额增加 10”之类的非幂等命令会执行两次。该方法同时检查日志
-// 是否连续：新批次的第一条日志最多只能是 appliedIndex+1，不能在中间留下空洞。
+// Ready 可能与本地进度重叠，重复执行非幂等命令会破坏状态。例如 appliedIndex=8、
+// 输入 [7,8,9,10] 时只返回 [9,10]。若输入从 10 开始，则索引 9 缺失，函数报错，
+// 而不是跨过空洞继续应用。
 //
-// 例如 appliedIndex=102，ents 的索引为 [101, 102, 103, 104]，前两条已经应用，
-// 因而应返回索引为 [103, 104] 的后缀。
-func (rc *raftNode) entriesToApply(ents []*raftpb.Entry) (nents []*raftpb.Entry) {
-	// 空批次无需过滤；直接返回还能保留调用方传入的 nil/空切片形态。
+// 该检查只验证批次起点；批次内部索引连续性由 Raft Ready 契约保证。
+func (rc *raftNode) entriesToApply(ents []*raftpb.Entry) ([]*raftpb.Entry, error) {
+	// 保留 nil 与非 nil 空切片的原始形态。
 	if len(ents) == 0 {
-		return ents
+		return ents, nil
 	}
 
-	// Entry.Index 是 Raft 日志中的全局索引，不是 ents 内部从零开始的切片下标。
+	// 使用首条日志的全局索引计算重叠前缀长度。
 	firstIdx := ents[0].GetIndex()
 	if firstIdx > rc.appliedIndex+1 {
-		// firstIdx 大于期望的下一索引说明日志不连续。例如 appliedIndex=10、
-		// firstIdx=12 时缺少索引 11，继续应用会破坏状态机的确定性。
-		log.Fatalf("first index of committed entry[%d] should <= progress.appliedIndex[%]+1", firstIdx, rc.appliedIndex)
+		// 新后缀只能从 appliedIndex+1 开始，任何更大值都代表本地缺少已提交日志。
+		return nil, fmt.Errorf(
+			"committed entries start at index %d after applied index %d",
+			firstIdx,
+			rc.appliedIndex,
+		)
 	}
 
-	// appliedIndex-firstIdx+1 表示批次开头已有多少条日志被应用过。
-	// 只有该数量小于批次长度时，ents 中才还包含需要应用的新日志。
-	if rc.appliedIndex-firstIdx+1 < uint64(len(ents)) {
-		// 注意：切片下标应是相对于 firstIdx 的偏移量，而 appliedIndex 是全局日志
-		// 索引。以上述 [101, 102, 103, 104] 为例，正确偏移量是 2；直接把全局索引
-		// 103 用作切片下标会越界。这里保留现有表达式，仅对这一易混淆点作出说明。
-		nents = ents[rc.appliedIndex+1:]
+	// applied 是输入中落在本地进度以内的条目数量。
+	var applied uint64
+	if firstIdx <= rc.appliedIndex {
+		applied = rc.appliedIndex - firstIdx + 1
+	}
+	if applied < uint64(len(ents)) {
+		return ents[applied:], nil
 	}
 
-	return nents
+	return nil, nil
 }
 
-// publishEntries 按顺序处理已提交日志，并把普通业务命令批量发布给上层状态机。
+// publishEntries 处理一段新的已提交日志，并将其中的普通命令组成一个状态机批次。
 //
-// 返回的只读通道用于等待业务命令全部应用完成；批次中没有业务命令时返回 nil。
-// 第二个返回值表示发布流程能否继续：true 表示本批次已成功交付或无需交付，false
-// 表示节点正在停止，或者当前成员已被配置变更移出集群。
-//
-// Raft 日志分为两类：EntryNormal 的 Data 是业务命令，EntryConfChange 的 Data
-// 是成员配置变更。两者都占用日志索引，但只有非空的普通日志需要发送到 commitC。
-func (rc *raftNode) publishEntries(ents []*raftpb.Entry) (<-chan struct{}, bool) {
+// 空 EntryNormal 常由新 Leader 用于提交当前任期，不进入业务状态机；非空普通条目
+// 保持原顺序发送到 commitC；EntryConfChange 则在此处更新协议成员和传输地址。
+// 返回通道在业务批次应用完成后关闭，没有普通命令时返回 nil。
+func (rc *raftNode) publishEntries(ents []*raftpb.Entry) (<-chan struct{}, error) {
 	if len(ents) == 0 {
-		return nil, true
+		return nil, nil
 	}
 
-	// 最多每条日志都包含一条业务命令，预分配容量可避免追加时反复扩容。
+	// 以条目总数作为容量上界，避免普通命令集中时重复扩容。
 	data := make([]string, 0, len(ents))
 	for i := range ents {
 		switch ents[i].GetType() {
 		case raftpb.EntryNormal:
 			if len(ents[i].GetData()) == 0 {
-				// Leader 当选后可能提交不含业务数据的空日志，用于确认其任期内的
-				// 提交位置；该日志参与推进索引，但不应交给键值状态机执行。
+				// 空普通条目仍推进 Raft 索引，但不表示一次键值操作。
 				break
 			}
 
-			// string 与 []byte 的转换保留原始字节内容，这里不负责解码业务命令；
-			// 真正的反序列化和执行由 commitC 的消费者完成。
+			// 原始字节以 string 承载，gob 解码留给唯一的状态机消费者完成。
 			s := string(ents[i].GetData())
 			data = append(data, s)
 		case raftpb.EntryConfChange:
-			// 配置变更使用 protobuf 编码。无法解码意味着已提交日志损坏或生产端
-			// 编码不匹配，当前实现选择立即终止，而不是跳过后造成成员视图分裂。
+			// 无法解析已提交配置日志时必须停止；跳过会导致节点使用不同投票集合。
 			var cc raftpb.ConfChange
 			if err := proto.Unmarshal(ents[i].Data, &cc); err != nil {
-				log.Fatalf("failed to unmarshal conf change: %v", ents[i])
+				return nil, fmt.Errorf(
+					"decode committed config change at index %d: %w",
+					ents[i].GetIndex(),
+					err,
+				)
 			}
 
-			// ApplyConfChange 只更新 Raft 协议层的投票成员集合，并返回制作快照时
-			// 需要保存的 ConfState；HTTP 地址仍需在 transport 中单独维护。
+			// 协议成员关系与 HTTP 对等连接分别由 raft.Node 和 transport 维护。
 			rc.confState = rc.node.ApplyConfChange(&cc)
 			switch cc.GetType() {
 			case raftpb.ConfChangeAddNode:
 				if len(cc.Context) > 0 {
-					// 本实现约定 Context 保存新成员的 Raft HTTP 地址。例如新增
-					// NodeID=3 时，Context 可为 "http://127.0.0.1:12380"。
+					// 例如 Context="http://127.0.0.1:9023" 为成员 3 建立传输连接。
 					rc.transport.AddPeer(types.ID(cc.GetNodeId()), []string{string(cc.Context)})
 				}
 
 			case raftpb.ConfChangeRemoveNode:
 				if cc.GetNodeId() == uint64(rc.id) {
-					// 当前成员一旦被共识日志移除，就不能继续参与投票或复制日志。
-					log.Panicln("I've been removed from the cluster! Shutting down.")
-					return nil, false
+					// 自移除只记录事件；当前实现不会在这里主动终止本进程。
+					log.Printf("member %d removed from cluster", rc.id)
+				} else {
+					// 其他成员移除后同步清理其 rafthttp 连接。
+					rc.transport.RemovePeer(types.ID(cc.GetNodeId()))
 				}
-
-				// 协议层成员关系已在 ApplyConfChange 中更新，此处再断开对应的
-				// HTTP 对等连接，避免继续向已移除成员发送 Raft 消息。
-				rc.transport.RemovePeer(types.ID(cc.GetNodeId()))
 			}
 		}
 	}
 
 	var applyDoneC chan struct{}
-	if len(data) > 0 {
-		// commit 中把通道暴露为只发送方向，而本方法保留双向引用并以只接收方向
-		// 返回给调用者：状态机负责关闭它，Raft 处理流程负责等待它。
-		applyDoneC = make(chan struct{}, 1)
-		select {
-		case rc.commitC <- &commit{
-			data:       data,
-			applyDoneC: applyDoneC,
-		}:
-		case <-rc.stopc:
-			// commitC 无消费者时，stopc 仍能打断阻塞发送并结束节点。
-			return nil, false
-		}
+	// 状态机持有关闭权限，主循环只保留接收方向用于快照前同步。
+	applyDoneC = make(chan struct{}, 1)
+	select {
+	case rc.commitC <- &commit{
+		data:         data,
+		applyDoneC:   applyDoneC,
+		raftLogIndex: ents[len(ents)-1].GetIndex(),
+	}:
+	case <-rc.stopc:
+		// 节点关闭优先于继续等待已经停止的状态机消费者。
+		return nil, nil
 	}
 
-	// 配置变更和空普通日志虽然不会进入 data，也同样属于已经处理的日志，所以直接
-	// 使用本批次最后一条日志的索引。若 applyDoneC 非 nil，调用方仍需等待状态机确认。
+	// 所有条目类型都推进发布进度；业务数据真正可见的时点由 applyDoneC 表示。
 	rc.appliedIndex = ents[len(ents)-1].GetIndex()
-	return applyDoneC, true
+	return applyDoneC, nil
 }
 
-// loadSnapshot 加载同时被快照目录和 WAL 检查点认可的最新快照。
+// publishReadStates 将本批 Ready 中的 ReadIndex 结果转交给业务状态机。
+// 未配置消费者却收到结果属于装配错误；停止过程中放弃发送则属于正常退出。
+func (rc *raftNode) publishReadStates(rdStates []raft.ReadState) error {
+	if len(rdStates) == 0 {
+		return nil
+	}
+	if rc.readStatesC == nil {
+		return errors.New("received Raft read state without a configured consumer")
+	}
+	select {
+	case rc.readStatesC <- rdStates:
+	case <-rc.stopc:
+		return nil
+	}
+	return nil
+}
+
+// loadSnapshot 选择同时存在于快照目录和有效 WAL 标记集合中的最新快照。
 //
-// 快照文件与 WAL 分开持久化，磁盘上可能出现没有对应 WAL 检查点的“孤儿快照”。
-// 例如快照文件已写到索引 120，但写 WAL 检查点失败，恢复时就不能贸然采用 120；
-// LoadNewestAvailable 会从有效 WAL 快照记录中选择能够匹配的最新快照文件。
-//
-// 该方法把“没有快照”视为正常的首次启动状态；其他读取或校验错误会直接终止进程。
-func (rc *raftNode) loadSnapshot() *raftpb.Snapshot {
+// 快照文件和 WAL 标记分开写入，故障后可能只剩前者。例如文件索引为 120、但 WAL
+// 最新有效标记是 100 时，只能恢复到两者共同认可的 100。没有任何快照是正常启动
+// 状态，以空 raftpb.Snapshot 返回；I/O 或校验错误则阻止启动。
+func (rc *raftNode) loadSnapshot() (*raftpb.Snapshot, error) {
 	if wal.Exist(rc.waldir) {
-		// 只有索引不大于 WAL 最新已提交 HardState 的快照记录才属于有效候选项。
+		// ValidSnapshotEntries 排除未被 WAL 提交进度认可的标记。
 		walSnaps, err := wal.ValidSnapshotEntries(zap.NewExample(), rc.waldir)
 		if err != nil {
-			log.Fatalf("kvstore: error listing snapshots (%v)", err)
+			return nil, fmt.Errorf("list valid WAL snapshots in %q: %w", rc.waldir, err)
 		}
 
-		// 从新到旧寻找元数据与有效 WAL 记录匹配的快照；损坏或不匹配的文件
-		// 不会被当作恢复基准。
+		// Snapshotter 从候选标记中寻找可读取且匹配的最新完整文件。
 		snapshot, err := rc.snapshotter.LoadNewestAvailable(walSnaps)
-		if err != nil && !errors.Is(err, snap.ErrNoSnapshot) {
-			log.Fatalf("kvstore: error loading snapshot (%v)", err)
+		if errors.Is(err, snap.ErrNoSnapshot) {
+			return &raftpb.Snapshot{}, nil
 		}
-		return snapshot
+		if err != nil {
+			return nil, fmt.Errorf("load newest snapshot from %q: %w", rc.snapdir, err)
+		}
+		if snapshot == nil {
+			return &raftpb.Snapshot{}, nil
+		}
+		return snapshot, nil
 	}
 
-	// WAL 尚不存在表示没有可验证的历史快照，返回空快照统一后续启动流程。
-	// 空快照的 Metadata 为 nil，区别于包含索引和任期的有效快照。
-	return &raftpb.Snapshot{}
+	// 没有 WAL 就没有可信的快照检查点，不能单独采用快照目录中的文件。
+	return &raftpb.Snapshot{}, nil
 }
 
-// openWAL 打开与给定快照衔接的 WAL；首次启动时会先创建一份空 WAL。
+// openWAL 从 snapshot 的 Index/Term 检查点打开 WAL，若目录不存在则先初始化。
 //
-// snapshot 决定 WAL 的读取起点。例如快照元数据为 Index=120、Term=7 时，
-// 后续 ReadAll 应从该检查点继续恢复索引大于 120 的日志。传入空快照则从 WAL
-// 起点恢复。该方法只负责创建或打开文件，真正读取记录由后续恢复流程完成。
-func (rc *raftNode) openWAL(snapshot *raftpb.Snapshot) *wal.WAL {
+// 例如检查点 {Index:120, Term:7} 使 ReadAll 返回该快照之后仍需恢复的记录；空快照
+// 使用零检查点，从 WAL 起点读取。函数只定位日志段，不把内容装入 MemoryStorage。
+func (rc *raftNode) openWAL(snapshot *raftpb.Snapshot) (*wal.WAL, error) {
 	if !wal.Exist(rc.waldir) {
-		// 目录权限 0750 表示所有者可读、写、进入，同组用户可读和进入，其他用户
-		// 无权限。os.Mkdir 只创建最后一级目录，因此 waldir 的父目录必须已存在。
+		// 0750 允许所有者读写、同组只读，拒绝其他用户访问节点日志。
 		if err := os.Mkdir(rc.waldir, 0o750); err != nil {
-			log.Fatalf("kvstore: cannot create dir for wal (%v)", err)
+			return nil, fmt.Errorf("create WAL directory %q: %w", rc.waldir, err)
 		}
 
-		// wal.Create 初始化 WAL 必需的元数据和首个日志段。创建后先关闭，再通过
-		// wal.Open 以统一路径按照指定快照检查点重新打开。
+		// 首次创建后重新 Open，使新旧节点统一走检查点定位路径。
 		w, err := wal.Create(zap.NewExample(), rc.waldir, nil)
 		if err != nil {
-			log.Fatalf("kvstore: create wal error (%v)", err)
+			return nil, fmt.Errorf("create WAL in %q: %w", rc.waldir, err)
 		}
 		if err := w.Close(); err != nil {
-			log.Fatalf("kvstore: close wal error (%v)", err)
+			return nil, fmt.Errorf("close newly created WAL in %q: %w", rc.waldir, err)
 		}
 	}
 
-	// 零值检查点 {Index: 0, Term: 0} 表示没有可用快照，需要从 WAL 起点读取。
+	// 零值 walpb.Snapshot 表示不跳过任何已有日志段。
 	walsnap := walpb.Snapshot{}
-	if snapshot.GetMetadata() != nil {
-		// 打开 WAL 只需用索引和任期定位对应检查点；ConfState 已保存在完整快照中。
+	if snapshot != nil && snapshot.GetMetadata() != nil {
+		// 定位只需要 Index 和 Term，ConfState 从完整快照恢复。
 		walsnap.Index, walsnap.Term = snapshot.Metadata.Index, snapshot.Metadata.Term
 	}
 
 	log.Printf("loading WAL at term %d and index %d", walsnap.GetTerm(), walsnap.GetIndex())
 
-	// wal.Open 会定位包含检查点的日志段，并准备从该快照之后读取；若 WAL 中找不到
-	// 匹配的 Index/Term，继续恢复可能产生错误状态，因此当前实现直接终止。
+	// 找不到匹配检查点意味着快照与 WAL 恢复链断裂，不能退化为从头启动。
 	w, err := wal.Open(zap.NewExample(), rc.waldir, &walsnap)
 	if err != nil {
-		log.Fatalf("kvstore: error loading wal (%v)", err)
+		return nil, fmt.Errorf(
+			"open WAL %q at term %d index %d: %w",
+			rc.waldir,
+			walsnap.GetTerm(),
+			walsnap.GetIndex(),
+			err,
+		)
 	}
-	return w
+	return w, nil
 }
 
-// replayWAL 从最新有效快照和其后的 WAL 记录重建 Raft 内存存储。
+// replayWAL 用最新可信快照及其后续 WAL 内容重建 raft.MemoryStorage。
 //
-// 恢复顺序必须是“快照 → HardState → 后续日志”。例如快照覆盖到索引 100，
-// WAL 还包含 101～120，则 MemoryStorage 先应用索引 100 的快照，再设置持久化的
-// term/vote/commit，最后追加 101～120，供 raft.RestartNode 继续运行。
-func (rc *raftNode) replayWAL() *wal.WAL {
+// 恢复顺序是 Snapshot、HardState、Entries。假设快照覆盖到 100、WAL 还有 101～120，
+// MemoryStorage 先建立索引 100 的基线，再恢复任期/投票/提交位置，最后追加剩余日志；
+// 任一步失败都会关闭刚打开的 WAL。
+func (rc *raftNode) replayWAL() (w *wal.WAL, retErr error) {
 	log.Printf("replaying WAL of member %d", rc.id)
 
-	// loadSnapshot 只选择有有效 WAL 检查点背书的快照；openWAL 从该检查点打开。
-	snapshot := rc.loadSnapshot()
-	w := rc.openWAL(snapshot)
+	// 快照选择和 WAL 打开共享同一个恢复锚点。
+	snapshot, err := rc.loadSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	w, err = rc.openWAL(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if retErr == nil || w == nil {
+			return
+		}
+		if err := w.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close WAL after recovery failure: %w", err))
+		}
+		w = nil
+	}()
 
-	// ReadAll 返回 WAL 元数据、HardState 和日志。此项目没有使用创建 WAL 时的
-	// 自定义 metadata，因此忽略第一个返回值。
+	// 项目没有使用 WAL 自定义 metadata，只恢复 HardState 和日志条目。
 	_, st, ents, err := w.ReadAll()
 	if err != nil {
-		log.Fatalf("kvstore: failed to read WAL (%v)", err)
+		return nil, fmt.Errorf("read WAL %q: %w", rc.waldir, err)
 	}
 
-	// MemoryStorage 是 Raft 协议运行期读取日志的来源，必须与磁盘恢复结果一致。
+	// 新建存储避免把恢复结果叠加到未知的旧内存状态上。
 	rc.raftStorage = raft.NewMemoryStorage()
-	if snapshot != nil {
-		// ApplySnapshot 把内存日志基线推进到快照索引。当前实现忽略其错误，
-		// 调用方必须确保只恢复有效且不落后于当前状态的快照。
-		rc.raftStorage.ApplySnapshot(snapshot)
-	}
-
-	// HardState 包含当前任期、已投票成员和提交索引，不属于业务快照数据。
-	rc.raftStorage.SetHardState(st)
-
-	// ents 仅包含打开快照检查点之后仍需保留的 Raft 日志。
-	rc.raftStorage.Append(ents)
-	return w
-}
-
-// writeError 发布后台错误并停止节点。
-//
-// 先停止 HTTP 并关闭 commitC，可让业务状态机退出提交消费循环；随后发送 errorC，
-// 使等待方能够区分正常关闭与异常退出。
-func (rc *raftNode) writeError(err error) {
-	rc.stopHTTP()
-	close(rc.commitC)
-	rc.errorC <- err
-	close(rc.errorC)
-	rc.node.Stop()
-}
-
-// startRaft 初始化磁盘状态、Raft 协议节点和节点间 HTTP 传输。
-//
-// 该方法由 newRaftNode 在独立 goroutine 中调用；初始化完成后，serveRaft 负责
-// 网络服务，serveChannels 负责 Tick、Ready、提案和关闭流程。
-func (rc *raftNode) startRaft() {
-	// 快照目录不存在时创建。0750 不允许其他用户访问持久化的业务数据。
-	if !fileutil.Exist(rc.snapdir) {
-		if err := os.Mkdir(rc.snapdir, 0o750); err != nil {
-			log.Fatalf("kvstore: cannot create dir for snapshot (%v)", err)
+	if snapshot != nil && !raft.IsEmptySnap(snapshot) {
+		// 已筛选的非空快照先建立压缩后的日志基线。
+		if err := rc.raftStorage.ApplySnapshot(snapshot); err != nil {
+			return nil, fmt.Errorf("apply recovered snapshot: %w", err)
 		}
 	}
 
-	// Snapshotter 本身不持有业务状态，只负责 snapdir 中快照文件的读写和校验。
+	// HardState 恢复 Term、Vote 和 Commit，不包含业务键值。
+	if err := rc.raftStorage.SetHardState(st); err != nil {
+		return nil, fmt.Errorf("restore Raft hard state: %w", err)
+	}
+
+	// 最后追加检查点之后的日志，以满足 RestartNode 的存储视图。
+	if err := rc.raftStorage.Append(ents); err != nil {
+		return nil, fmt.Errorf("append recovered WAL entries: %w", err)
+	}
+	return w, nil
+}
+
+// finish 按网络、Raft、状态机通道、WAL 的顺序回收资源，并关闭 errorC。
+//
+// serveChannels 保证只调用一次。若 runErr 和 WAL Close 同时失败，errors.Join 保留
+// 两个原因；正常退出不向 errorC 写值，调用方通过通道关闭感知完成。
+func (rc *raftNode) finish(runErr error) {
+	rc.stopHTTP()
+	rc.node.Stop()
+	close(rc.commitC)
+	if err := rc.wal.Close(); err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("close WAL: %w", err))
+	}
+	if runErr != nil {
+		rc.errorC <- runErr
+	}
+	close(rc.errorC)
+}
+
+// startRaft 验证本地成员配置，恢复持久化状态并启动协议与传输协程。
+//
+// 对外可见的 goroutine 最后启动，因此此前发生的 URL、目录、WAL 或监听错误都会同步
+// 返回。延迟清理覆盖“WAL 已打开但传输层启动失败”等部分初始化场景。
+func (rc *raftNode) startRaft() (retErr error) {
+	if rc.id < 1 || rc.id > len(rc.peers) {
+		return fmt.Errorf("member ID %d is outside peer range [1,%d]", rc.id, len(rc.peers))
+	}
+
+	localURL, err := url.Parse(rc.peers[rc.id-1])
+	if err != nil {
+		return fmt.Errorf("parse local Raft URL %q: %w", rc.peers[rc.id-1], err)
+	}
+	if localURL.Scheme == "" || localURL.Host == "" {
+		return fmt.Errorf("local Raft URL %q must include scheme and host", rc.peers[rc.id-1])
+	}
+
+	// 快照可能含完整业务值，目录权限不向其他用户开放。
+	if !fileutil.Exist(rc.snapdir) {
+		if err := os.Mkdir(rc.snapdir, 0o750); err != nil {
+			return fmt.Errorf("create snapshot directory %q: %w", rc.snapdir, err)
+		}
+	}
+
+	// Snapshotter 是无状态文件访问器，业务数据仍由 kvstore 持有。
 	rc.snapshotter = snap.New(zap.NewExample(), rc.snapdir)
 
-	// 必须在 replayWAL 之前记录 WAL 是否原本存在，因为 replayWAL 在首次启动时会
-	// 创建 WAL；该布尔值决定后面使用 RestartNode 还是 StartNode。
+	// replayWAL 会在首次启动时创建目录，故必须预先记住是否存在历史 WAL。
 	oldwal := wal.Exist(rc.waldir)
-	rc.wal = rc.replayWAL()
+	if w, err := rc.replayWAL(); err != nil {
+		return err
+	} else {
+		rc.wal = w
+	}
+	started := false
+	defer func() {
+		if started {
+			return
+		}
+		if rc.node != nil {
+			rc.node.Stop()
+		}
+		if rc.wal != nil {
+			if err := rc.wal.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close WAL after startup failure: %w", err))
+			}
+		}
+	}()
 
-	// 发布快照组件，使 kvstore 可以先恢复业务快照再消费提交日志。
-	// snapshotterReady 若为 nil，此发送会永久阻塞，后续初始化都不会发生。
-	rc.snapshotterReady <- rc.snapshotter
-
-	// 当前示例把 peers 的切片位置映射为从 1 开始的 Raft ID。
-	// 例如 len(peers)=3 会得到初始成员 {1, 2, 3}。
+	// 新集群的初始成员 ID 由 peers 位置生成，例如三个地址对应 {1,2,3}。
 	rpeers := make([]raft.Peer, len(rc.peers))
 	for i := range rpeers {
 		rpeers[i] = raft.Peer{ID: uint64(i + 1)}
 	}
 
-	// Tick 的实际时间由 serveChannels 中 100ms 的 ticker 决定：
-	// HeartbeatTick=1 约为 100ms，ElectionTick=10 约为 1s。
+	// 100ms 逻辑 tick 下，心跳约每 100ms 一次，选举超时基准约为 1s。
 	c := &raft.Config{
 		ID:            uint64(rc.id),
 		ElectionTick:  10,
 		HeartbeatTick: 1,
 		Storage:       rc.raftStorage,
-		// 单条 Raft 网络消息最多携带约 1 MiB 日志数据。
+		// 限制一条发送消息中日志载荷的近似上限。
 		MaxSizePerMsg: 1024 * 1024,
-		// 每个 Follower 最多允许 256 条正在传输但尚未确认的追加消息。
+		// 限制每个 Follower 未确认 Append 消息的流水线深度。
 		MaxInflightMsgs: 256,
-		// Leader 最多积压约 1 GiB 尚未提交的日志载荷，防止提案无限占用内存。
+		// 对 Leader 尚未提交的日志总量施加约 1 GiB 的背压上限。
 		MaxUncommittedEntriesSize: 1 << 30,
 	}
 
-	// 有旧 WAL 时必须按恢复出的 HardState 和日志继续运行。join=true 同样不能
-	// 重新提交初始 peers，否则会把加入现有集群误当作创建新集群。
+	// 历史 WAL 或 join 模式都从已有协议状态恢复；只有全新引导才提交 rpeers。
 	if oldwal || rc.join {
 		rc.node = raft.RestartNode(c)
 	} else {
 		rc.node = raft.StartNode(c, rpeers)
 	}
 
-	// rafthttp.Transport 只负责 Raft 协议消息，不承载面向客户端的键值 HTTP API。
-	// ClusterID 用于拒绝来自其他逻辑集群的消息；同一集群所有成员必须保持一致。
+	// 该 Transport 专用于成员间协议流量。固定 ClusterID 使它拒绝其他集群的消息。
 	rc.transport = &rafthttp.Transport{
 		Logger:      zap.NewExample(),
 		ID:          types.ID(rc.id),
@@ -518,269 +550,314 @@ func (rc *raftNode) startRaft() {
 		LeaderStats: stats.NewLeaderStats(zap.NewExample(), strconv.Itoa(rc.id)),
 		ErrorC:      make(chan error),
 	}
+	ln, err := newStoppableListener(localURL.Host, rc.httpstopc)
+	if err != nil {
+		return fmt.Errorf("listen for Raft HTTP on %q: %w", localURL.Host, err)
+	}
 
-	// Start 初始化传输层内部 goroutine；随后为除自己以外的初始成员配置地址。
-	rc.transport.Start()
+	// 先启动传输内部组件，再注册所有远端 peer；本成员不需要回环连接。
+	if err := rc.transport.Start(); err != nil {
+		if closeErr := ln.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close Raft listener after startup failure: %w", closeErr))
+		}
+		return err
+	}
+
 	for i := range rc.peers {
 		if i+1 != rc.id {
 			rc.transport.AddPeer(types.ID(i+1), []string{rc.peers[i]})
 		}
 	}
 
-	// 网络接收和 Raft 状态推进相互独立：前者把消息交给 Process，后者从 Ready
-	// 持久化结果并发送出站消息。
-	go rc.serveRaft()
+	// serveRaft 接收网络消息，serveChannels 驱动 Ready 和持久化，两者并行运行。
+	go rc.serveRaft(ln)
 	go rc.serveChannels()
+	started = true
+	return nil
 }
 
-// stop 执行没有附带错误的节点关闭流程。
+// stopHTTP 先停止对等传输，再关闭监听信号并等待 Serve 协程确认退出。
 //
-// 与 writeError 不同，它只关闭 errorC，不发送错误值。通道关闭会通知所有等待者
-// 节点生命周期结束。该方法及 writeError 都要求只调用一次，否则重复 close 会 panic。
-func (rc *raftNode) stop() {
-	rc.stopHTTP()
-	close(rc.commitC)
-	close(rc.errorC)
-	rc.node.Stop()
-}
-
-// stopHTTP 停止 rafthttp 传输层，并等待 HTTP Serve goroutine 完全退出。
-//
-// httpstopc 是停止请求，httpdonec 是完成确认；两阶段握手避免节点在监听端口和连接
-// 尚未释放时就继续执行后续关闭操作。
+// 请求/确认两阶段同步保证 finish 返回前端口和传输连接已经释放。
 func (rc *raftNode) stopHTTP() {
 	rc.transport.Stop()
 	close(rc.httpstopc)
 	<-rc.httpdonec
 }
 
-// publishSnapshot 把一个从其他节点收到的新快照发布给业务状态机。
+// publishSnapshot 通知业务状态机加载已经持久化并应用到 MemoryStorage 的新快照。
 //
-// 此处的“发布”不同于 saveSnap：saveSnap 负责磁盘持久化，publishSnapshot 负责
-// 通知 kvstore 重新加载该快照，并同步本节点的成员配置与应用进度。只有索引严格
-// 大于 appliedIndex 的快照才代表更新的状态。
-func (rc *raftNode) publishSnapshot(snapshotToSave *raftpb.Snapshot) {
-	// 空快照是 Ready 的正常零值，不包含需要发布的状态。
+// saveSnap 处理磁盘耐久性，本方法处理运行期可见性。它通过 nil commit 触发 kvstore
+// 从同一 Snapshotter 重载，并把成员配置、快照水位和应用水位推进到快照索引。
+// 不严格新于 appliedIndex 的快照会导致状态倒退，因而被拒绝。
+func (rc *raftNode) publishSnapshot(snapshotToSave *raftpb.Snapshot) error {
+	// Ready.Snapshot 的零值不代表状态变化。
 	if raft.IsEmptySnap(snapshotToSave) {
-		return
+		return nil
 	}
 
-	// 注意：这里打印的是更新前的 rc.snapshotIndex，而不是 snapshotToSave 的索引；
-	// 因此“publishing”日志可能显示旧值，defer 日志则会读取更新后的新值。
-	log.Printf("publishing snapshot at index %d", rc.snapshotIndex)
-	defer log.Printf("finished publishing snapshot at index %d", rc.snapshotIndex)
+	snapshotIndex := snapshotToSave.GetMetadata().GetIndex()
+	log.Printf("publishing snapshot at index %d", snapshotIndex)
+	defer log.Printf("finished publishing snapshot at index %d", snapshotIndex)
 
-	// 应用旧快照会让状态机倒退。例如当前已应用到 120 时，索引 100 的快照必须拒绝。
-	if snapshotToSave.GetMetadata().GetIndex() <= rc.appliedIndex {
-		log.Fatalf("snapshot index [%d] should > progress.appliedIndex [%d]", snapshotToSave.Metadata.GetIndex(), rc.appliedIndex)
+	// 例如本地进度为 120 时，索引 100 或 120 都不是可发布的新基线。
+	if snapshotIndex <= rc.appliedIndex {
+		return fmt.Errorf(
+			"received snapshot index %d is not newer than applied index %d",
+			snapshotIndex,
+			rc.appliedIndex,
+		)
 	}
 
-	// nil commit 是 kvstore.readCommits 约定的控制信号：从 snapshotter 重新加载
-	// 完整业务状态，而不是把 nil 当作一批空日志。
-	rc.commitC <- nil
+	// nil 是通道协议中的“整体重载”标记，与空业务批次含义不同。
+	select {
+	case rc.commitC <- nil:
+	case <-rc.stopc:
+		return nil
+	}
 
-	// 快照是截至其 Metadata.Index 的完整状态，因此三个恢复基准需要同步推进。
+	// 完整快照同时确定业务进度和成员配置，三个字段必须原子式连续更新。
 	rc.confState = snapshotToSave.Metadata.GetConfState()
-	rc.snapshotIndex = snapshotToSave.Metadata.GetIndex()
-	rc.appliedIndex = snapshotToSave.Metadata.GetIndex()
+	rc.snapshotIndex = snapshotIndex
+	rc.appliedIndex = snapshotIndex
+	return nil
 }
 
-// snapshotCatchUpEntriesN 是制作快照后仍保留在 MemoryStorage 中的历史日志窗口。
+// snapshotCatchUpEntriesN 是内存压缩后为增量追赶保留的最近日志数量。
 //
-// 保留最近约 10000 条日志可以让稍微落后的 Follower 通过增量日志追赶；只有落后
-// 超过该窗口的节点才需要接收体积通常更大的完整快照。
+// 值为 10000 时，落后不足该窗口的 Follower 通常仍可接收 Append；更旧的节点需要
+// 通过快照恢复。它与触发快照的 defaultSnapshotCount 相互独立。
 var snapshotCatchUpEntriesN uint64 = 10000
 
-// maybeTriggerSnapshot 在累计日志超过阈值时制作业务快照并压缩内存日志。
+// maybeTriggerSnapshot 在应用水位超过快照阈值后生成持久化快照并压缩内存日志。
 //
-// applyDoneC 对应本批次业务命令的应用确认。制作快照前必须等待它关闭，否则
-// appliedIndex 可能已经推进，但 getSnapshot 读到的 map 仍未包含对应命令，
-// 最终生成“元数据索引比业务数据更新”的不一致快照。
-func (rc *raftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
-	// uint64 减法要求 appliedIndex >= snapshotIndex；正常流程通过单调递增索引维持
-	// 该不变量。差值不超过阈值时，继续保留增量日志比频繁制作快照更经济。
+// publishEntries 会先推进 appliedIndex 再由另一个协程修改 map，因此触发快照时必须
+// 等待 applyDoneC。否则可能生成 Metadata.Index=200、业务数据却只应用到 199 的
+// 无效恢复基线。未达到阈值时无需等待该通道。
+func (rc *raftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) error {
+	// 先验证单调性，避免无符号减法下溢把异常进度误判为巨大差值。
+	if rc.appliedIndex < rc.snapshotIndex {
+		return fmt.Errorf(
+			"applied index %d is behind snapshot index %d",
+			rc.appliedIndex,
+			rc.snapshotIndex,
+		)
+	}
 	if rc.appliedIndex-rc.snapshotIndex <= rc.snapCount {
-		return
+		return nil
 	}
 
 	if applyDoneC != nil {
-		// 同时监听 stopc，避免状态机不再确认时阻塞节点关闭。
+		// 停止信号使关闭过程不依赖状态机一定能返回确认。
 		select {
 		case <-applyDoneC:
 		case <-rc.stopc:
-			return
+			return nil
 		}
 	}
 
 	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", rc.appliedIndex, rc.snapshotIndex)
 
-	// getSnapshot 序列化业务 map；它不包含 Raft 的索引、任期或 ConfState。
+	// 回调只产生业务 JSON，Raft 元数据由下一步根据内存日志补齐。
 	data, err := rc.getSnapshot()
 	if err != nil {
-		log.Panic(err)
+		return fmt.Errorf("serialize state machine snapshot: %w", err)
 	}
 
-	// CreateSnapshot 把业务数据与 appliedIndex 处的 Raft 任期、成员配置组合成
-	// 完整快照。confState 使接收方无需重放更早的成员变更日志。
-	snap, err := rc.raftStorage.CreateSnapshot(rc.appliedIndex, rc.confState, data)
+	// CreateSnapshot 将业务数据绑定到 appliedIndex 处的任期和当前 ConfState。
+	snapshot, err := rc.raftStorage.CreateSnapshot(rc.appliedIndex, rc.confState, data)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("create Raft snapshot at index %d: %w", rc.appliedIndex, err)
 	}
 
-	// 必须先成功持久化，才能压缩被该快照覆盖的内存日志。
-	if err := rc.saveSnap(snap); err != nil {
-		panic(err)
+	// 在快照具备耐久性之前，不能丢弃唯一可用于恢复的历史日志。
+	if err := rc.saveSnap(snapshot); err != nil {
+		return err
 	}
 
-	// 默认至少从索引 1 开始；当 appliedIndex 足够大时，只回收追赶窗口之前的日志。
-	// 例如 appliedIndex=25000、窗口=10000，则 compactIndex=15000。
+	// 例如 appliedIndex=25000 且窗口为 10000，只压缩到 15000，保留其后的增量日志。
 	compactIndex := uint64(1)
 	if rc.appliedIndex > snapshotCatchUpEntriesN {
 		compactIndex = rc.appliedIndex - snapshotCatchUpEntriesN
 	}
 
 	if err := rc.raftStorage.Compact(compactIndex); err != nil {
-		// raft.ErrCompacted 通常表示目标索引早已被压缩，可视为幂等结果；其他错误
-		// 才更值得终止。当前判断恰好只对 ErrCompacted 执行 panic，并忽略其他错误，
-		// 此处保留既有实现，仅明确该行为。
-		if errors.Is(err, raft.ErrCompacted) {
-			panic(err)
+		// 重复压缩返回 ErrCompacted，可按已达到目标处理。
+		if !errors.Is(err, raft.ErrCompacted) {
+			return fmt.Errorf("compact Raft log at index %d: %w", compactIndex, err)
 		}
 	} else {
 		log.Printf("compacted log at index %d", compactIndex)
 	}
 
-	// 只有快照保存和内存压缩流程结束后，才推进下一轮快照的比较基准。
+	// 全部步骤成功后才更新阈值基准，失败会在后续 Ready 中重新尝试。
 	rc.snapshotIndex = rc.appliedIndex
+	return nil
 }
 
-// serveChannels 驱动 Raft 的核心事件循环。
+// serveChannels 是单个成员的 Ready 处理与生命周期主循环。
 //
-// 它同时负责四类事件：定时 Tick、Node.Ready 的持久化与发布、传输层错误、节点停止。
-// 另一个内部 goroutine 把业务提案和配置变更送入 raft.Node。除状态机 map 外，
-// raftNode 的大部分推进状态都集中在此流程中顺序修改。
+// 主协程串行处理 Tick、Ready、网络错误和停止信号；内部提案协程负责调用 Propose、
+// ProposeConfChange 与 ReadIndex。单线程推进 Ready 可避免 WAL、MemoryStorage、
+// appliedIndex 和 snapshotIndex 被不同批次交错修改。
 func (rc *raftNode) serveChannels() {
-	// MemoryStorage.Snapshot 返回当前恢复基线。启动时三项状态都从同一个快照元数据
-	// 初始化，避免成员配置、快照索引和应用索引彼此不一致。
-	snap, err := rc.raftStorage.Snapshot()
+	// 启动进度统一取自恢复后的内存快照，确保三个水位属于同一恢复基线。
+	snapshot, err := rc.raftStorage.Snapshot()
 	if err != nil {
-		panic(err)
+		rc.finish(fmt.Errorf("load initial in-memory Raft snapshot: %w", err))
+		return
 	}
-	rc.confState = snap.GetMetadata().ConfState
-	rc.snapshotIndex = snap.GetMetadata().GetIndex()
-	rc.appliedIndex = snap.GetMetadata().GetIndex()
+	rc.confState = snapshot.GetMetadata().ConfState
+	rc.snapshotIndex = snapshot.GetMetadata().GetIndex()
+	rc.appliedIndex = snapshot.GetMetadata().GetIndex()
 
-	// serveChannels 是 WAL 运行期所有者；事件循环退出时关闭文件和相关锁。
-	defer rc.wal.Close()
-
-	// 每个 tick 为 100ms，结合 Config 中的 HeartbeatTick 和 ElectionTick 换算实际周期。
+	// raft.Node 使用逻辑 tick；墙钟定时器只负责按 100ms 推进一步。
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	// 提案接收独立于 Ready 处理，避免外部发送者被磁盘写入和网络发送长期阻塞。
+	// 独立协程使输入通道消费不必等待当前 Ready 完成磁盘 I/O。
 	go func() {
-		// ConfChange.Id 用于区分配置变更提案；计数器在本次进程生命周期内递增。
+		// 配置变更 ID 只保证本进程运行期内单调且不重复。
 		confChangeCount := uint64(0)
 
-		// 当前条件要求两个输入通道都仍然有效：其中任意一个关闭并被置为 nil 后，
-		// 循环都会退出并停止整个节点，而不是继续单独消费另一个通道。
-		for rc.proposeC != nil && rc.confChangC != nil {
+		// 已关闭的输入被置 nil，从 select 中移除；三类输入全部结束后才广播停止。
+		for rc.proposeC != nil || rc.confChangC != nil || rc.readIndexC != nil {
 			select {
 			case prop, ok := <-rc.proposeC:
 				if !ok {
-					// nil 通道在 select 中永远不可用，常用于禁用已经关闭的分支。
+					// 对 nil 通道的收发永远阻塞，可安全禁用该分支。
 					rc.proposeC = nil
 				} else {
-					// Propose 只把命令送入本地 Raft；能否提交取决于当前是否有 Leader
-					// 以及能否联系多数派。context.TODO 不提供取消或超时。
-					rc.node.Propose(context.TODO(), []byte(prop))
+					// 这里回报的是 node.Propose 调用结果，最终提交仍取决于 Leader 和多数派。
+					prop.resultC <- rc.node.Propose(prop.ctx, []byte(prop.data))
 				}
 			case cc, ok := <-rc.confChangC:
 				if !ok {
 					rc.confChangC = nil
 				} else {
 					confChangeCount++
-					// 同一运行期内为配置变更分配递增 ID，然后作为 Raft 日志提议。
-					cc.Id = new(confChangeCount)
-					rc.node.ProposeConfChange(context.TODO(), cc)
+					// ID 在进入 Raft 前写入，以关联配置变更日志。
+					cc.confChange.Id = new(confChangeCount)
+					cc.resultC <- rc.node.ProposeConfChange(cc.ctx, cc.confChange)
 				}
-
+			case rctx, ok := <-rc.readIndexC:
+				if !ok {
+					rc.readIndexC = nil
+				} else {
+					rctx.resultC <- rc.node.ReadIndex(rctx.ctx, rctx.requestCtx)
+				}
 			}
 		}
 
-		// 两类提案输入中任意一类结束都会触发节点整体关闭。
+		// 关闭 stopc 会同时解除主循环和阻塞中的发布操作。
 		close(rc.stopc)
 	}()
 
 	for {
 		select {
 		case <-ticker.C:
-			// Tick 推进逻辑时钟，可能触发心跳、选举超时或重新发送消息。
+			// Tick 可能触发选举、心跳或复制重试，但不直接执行磁盘 I/O。
 			rc.node.Tick()
-		case rd := <-rc.node.Ready():
-			// Ready 是一批必须按 Raft 约定处理的工作：持久化状态和日志、应用快照、
-			// 发送消息、发布已提交条目，最后调用 Advance 确认处理完成。
+		case rd, ok := <-rc.node.Ready():
+			if !ok {
+				rc.finish(errors.New("raft Ready channel closed unexpectedly"))
+				return
+			}
+			// 每批 Ready 遵循“持久化 → 更新存储 → 发送 → 应用 → Advance”的顺序。
 			if !raft.IsEmptySnap(rd.Snapshot) {
-				// 先把收到或生成的快照持久化。当前实现忽略 saveSnap 返回的错误；
-				// 若磁盘写入失败，后续继续 Advance 可能丢失恢复所需状态。
-				rc.saveSnap(rd.Snapshot)
+				// 完整快照在进入 MemoryStorage 前先写入恢复链。
+				if err := rc.saveSnap(rd.Snapshot); err != nil {
+					rc.finish(err)
+					return
+				}
 			}
 
-			// 空 HardState 表示本批次的 term/vote/commit 没有变化；向 WAL 传 nil
-			// 可以只保存 rd.Entries，而无需重复写入零值 HardState。
+			// nil HardState 告诉 WAL 本批只有 Entries 需要保存。
 			var hs *raftpb.HardState
 			if !raft.IsEmptyHardState(rd.HardState) {
 				hs = rd.HardState
 			}
 
-			// 在发送依赖这些状态的网络消息前，必须先把 HardState 和新日志写入 WAL。
-			// 当前实现没有检查 Save 的错误，生产代码通常应把失败交给 writeError。
-			rc.wal.Save(hs, rd.Entries)
+			// 对外发送前落盘，保证崩溃恢复后仍能兑现已发送消息所宣称的状态。
+			if err := rc.wal.Save(hs, rd.Entries); err != nil {
+				rc.finish(fmt.Errorf("persist Raft hard state and entries: %w", err))
+				return
+			}
 			if !raft.IsEmptySnap(rd.Snapshot) {
-				// 磁盘保存成功后再更新内存存储，并通知业务状态机加载完整快照。
-				rc.raftStorage.ApplySnapshot(rd.Snapshot)
-				rc.publishSnapshot(rd.Snapshot)
+				// 磁盘和协议内存先采用快照，之后业务状态机再从快照目录重载。
+				if err := rc.raftStorage.ApplySnapshot(rd.Snapshot); err != nil {
+					rc.finish(fmt.Errorf("apply Ready snapshot to memory storage: %w", err))
+					return
+				}
+
+				if err := rc.publishSnapshot(rd.Snapshot); err != nil {
+					rc.finish(err)
+					return
+				}
+
 			}
 
-			// rd.Entries 是尚未加入 MemoryStorage 的不稳定日志；它不同于下面已经
-			// 达成多数派提交、可交给状态机执行的 rd.CommittedEntries。
-			rc.raftStorage.Append(rd.Entries)
-
-			// 日志和 HardState 已持久化后才发送出站消息，避免对外宣称本节点拥有
-			// 一份崩溃后无法恢复的状态。
-			rc.transport.Send(rc.processMessages(rd.Messages))
-
-			// 过滤重复日志，再按类型处理业务命令和成员配置变更。
-			applyDoneC, ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries))
-			if !ok {
-				rc.stop()
+			// Entries 是新增但未必提交的日志；CommittedEntries 才可执行到业务状态机。
+			if err := rc.raftStorage.Append(rd.Entries); err != nil {
+				rc.finish(fmt.Errorf("append Ready entries to memory storage: %w", err))
 				return
 			}
 
-			// 只有达到快照阈值时 maybeTriggerSnapshot 才等待 applyDoneC；未达到阈值
-			// 时会直接返回，因此当前流程可能在业务状态机真正执行完本批次前 Advance。
-			rc.maybeTriggerSnapshot(applyDoneC)
+			// processMessages 仅对快照消息补齐成员配置，再交给异步传输层。
+			rc.transport.Send(rc.processMessages(rd.Messages))
 
-			// Advance 告诉 raft.Node：当前 Ready 已处理，可以释放内部引用并产生下一批。
+			// 去掉与 appliedIndex 重叠的提交前缀，防止状态机重复执行命令。
+			entries, err := rc.entriesToApply(rd.CommittedEntries)
+			if err != nil {
+				rc.finish(err)
+				return
+			}
+			applyDoneC, err := rc.publishEntries(entries)
+			if err != nil {
+				rc.finish(err)
+				return
+			}
+
+			// 仅在本批触发快照时同步等待应用；常规批次允许状态机与后续 Ready 流水执行。
+			if err := rc.maybeTriggerSnapshot(applyDoneC); err != nil {
+				rc.finish(err)
+				return
+			}
+
+			err = rc.publishReadStates(rd.ReadStates)
+			if err != nil {
+				rc.finish(err)
+				return
+			}
+
+			// Advance 移交本批 Ready 的所有权，之后不得再依赖其中的可变切片。
 			rc.node.Advance()
-		case err := <-rc.transport.ErrorC:
-			// 传输层错误通常意味着节点间通信服务无法继续，按异常流程关闭并上报。
-			rc.writeError(err)
+		case err, ok := <-rc.transport.ErrorC:
+			// 传输错误按节点级故障处理；关闭或 nil 值会转换为可诊断错误。
+			if !ok {
+				err = errors.New("raft transport error channel closed unexpectedly")
+			} else if err == nil {
+				err = errors.New("raft transport reported a nil error")
+			}
+			rc.finish(err)
+			return
+		case err := <-rc.httpErrorC:
+			rc.finish(err)
 			return
 		case <-rc.stopc:
-			// 提案输入关闭或外部停止信号触发正常关闭。
-			rc.stop()
+			// 所有输入通道结束触发正常资源回收，不向 errorC 写入错误。
+			rc.finish(nil)
 			return
 		}
 	}
 }
 
-// processMessages 为待发送的快照消息补充最新成员配置。
+// processMessages 用当前 confState 覆盖每条 MsgSnap 中的成员配置。
 //
-// 普通 Append、Heartbeat 等消息保持不变。MsgSnap 的 ConfState 必须与快照代表的
-// 集群成员关系一致，否则接收方恢复数据后可能使用错误的投票成员集合。
+// Append 和 Heartbeat 原样返回。快照接收方会以 Snapshot.Metadata.ConfState 恢复
+// 投票集合，因此发送前必须与本节点已应用的配置保持一致。
 func (rc *raftNode) processMessages(ms []*raftpb.Message) []*raftpb.Message {
-	// 结果切片复用原有消息指针，只新建切片头；对 MsgSnap 的修改也会反映到 ms。
+	// 仅分配新的切片头和底层指针数组，消息对象本身仍与输入共享。
 	var messages []*raftpb.Message
 	for i := 0; i < len(ms); i++ {
 		if ms[i].GetType() == raftpb.MsgSnap {
@@ -791,58 +868,48 @@ func (rc *raftNode) processMessages(ms []*raftpb.Message) []*raftpb.Message {
 	return messages
 }
 
-// serveRaft 在当前成员的 peer 地址上提供 rafthttp 服务。
+// serveRaft 使用已经创建的监听器承载成员间 rafthttp Handler。
 //
-// peers 使用从 1 开始的节点 ID，因此节点 id 对应 peers[id-1]。该 HTTP 服务仅
-// 收发 Raft 协议消息，客户端 GET/PUT 请求由 serveHTTPKVAPI 的独立端口处理。
-func (rc *raftNode) serveRaft() {
-	// url.Parse 负责拆出 scheme 和 Host；监听器只需要 host:port 部分。
-	// id 必须处于 [1, len(peers)]，否则 peers[id-1] 会发生切片越界。
-	url, err := url.Parse(rc.peers[rc.id-1])
-	if err != nil {
-		log.Fatalf("kvstore: Failed parsing URL (%v)", err)
-	}
-
-	// stoppableListener 使 stopHTTP 可以通过关闭 httpstopc 中断阻塞的 Accept。
-	ln, err := newStoppableListener(url.Host, rc.httpstopc)
-	if err != nil {
-		log.Fatalf("kvstore: Failed to listen rafthttp (%v)", err)
-	}
-
-	// Transport.Handler 校验并解码对端 Raft 消息，随后通过 Process 交给 raft.Node。
-	// http.Server.Serve 在监听器停止时会返回一个非 nil 错误，因此需结合 httpstopc
-	// 判断它是预期关闭还是意外故障。
-	err = (&http.Server{Handler: rc.transport.Handler()}).Serve(ln)
+// 预先监听使端口占用等错误能在 startRaft 中同步返回。运行后若 Serve 意外结束，
+// 错误经 httpErrorC 交给主循环；由 httpstopc 或 stopc 导致的退出视为预期关闭。
+func (rc *raftNode) serveRaft(ln *stoppableListener) {
+	defer close(rc.httpdonec)
+	// Handler 完成协议校验与解码，并通过 Process 将消息送入 raft.Node。
+	err := (&http.Server{Handler: rc.transport.Handler()}).Serve(ln)
 	select {
 	case <-rc.httpstopc:
-		// 收到停止信号后的 Serve 错误属于正常关闭。
+		// 主动网络关闭通常表现为 Serve 返回错误，但无需上报。
+		return
+	case <-rc.stopc:
+		return
 	default:
-		log.Fatalf("kvstore: Failed to serve rafthttp (%v)", err)
 	}
 
-	// 通知 stopHTTP：服务循环已经退出，监听资源可以视为释放完成。
-	close(rc.httpdonec)
+	if err == nil {
+		err = errors.New("raft HTTP server stopped without an error")
+	}
+	rc.httpErrorC <- fmt.Errorf("serve Raft HTTP: %w", err)
 }
 
-// Process 实现 rafthttp.Raft.Process，把收到的协议消息交给本地 Raft 状态机。
+// Process 实现 rafthttp.Raft，将已经解码的对等消息交给 raft.Node.Step。
 func (rc *raftNode) Process(ctx context.Context, m *raftpb.Message) error {
 	return rc.node.Step(ctx, m)
 }
 
-// IsIDRemoved 实现 rafthttp.Raft.IsIDRemoved。
+// IsIDRemoved 实现 rafthttp.Raft；当前传输层不会在接收阶段拒绝历史成员 ID。
 //
-// 当前实现始终返回 false，表示传输层不会仅凭本回调拒绝某个历史成员 ID；
-// 成员移除后的连接清理由 publishEntries 显式调用 transport.RemovePeer 完成。
+// 已提交移除日志会由 publishEntries 调用 RemovePeer 清理主动连接，但本方法没有维护
+// 一份持久化的 removed-ID 集合，因此始终返回 false。
 func (rc *raftNode) IsIDRemoved(_ uint64) bool { return false }
 
-// ReportUnreachable 实现 rafthttp.Raft.ReportUnreachable，通知 Raft 某成员暂时不可达。
+// ReportUnreachable 实现 rafthttp.Raft，把对等节点暂时不可达反馈给复制进度状态机。
 //
-// Raft 会据此调整向该 Follower 复制日志的进度状态，但不会自动把它移出集群。
+// 该事件影响重试和探测，不会自动执行成员移除。
 func (rc *raftNode) ReportUnreachable(id uint64) { rc.node.ReportUnreachable(id) }
 
-// ReportSnapshot 实现 rafthttp.Raft.ReportSnapshot，报告一次快照发送成功或失败。
+// ReportSnapshot 实现 rafthttp.Raft，反馈一次向 Follower 发送快照的最终状态。
 //
-// 该反馈让 Leader 决定把对应 Follower 的复制状态推进到快照之后，还是稍后重试。
+// 成功时 Raft 可把该 Follower 的复制进度移到快照之后；失败时保留重试所需状态。
 func (rc *raftNode) ReportSnapshot(id uint64, status raft.SnapshotStatus) {
 	rc.node.ReportSnapshot(id, status)
 }
