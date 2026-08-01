@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package kvstore;
+
+option go_package = "kvstore/pb;kvstorepb";
+
+// KVStore exposes replicated writes and the three supported read semantics.
+service KVStore {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
+}
+
+// Cluster exposes Raft membership proposals. An accepted response means the
+// local Raft node accepted the proposal; commitment still requires consensus.
+service Cluster {
+  rpc AddMember(AddMemberRequest) returns (MemberChangeResponse);
+  rpc RemoveMember(RemoveMemberRequest) returns (MemberChangeResponse);
+}
+
+// ReadMode selects the visibility and coordination cost of Read.
+enum ReadMode {
+  // READ_MODE_UNSPECIFIED is normalized to READ_MODE_LINEARIZABLE by the server.
+  READ_MODE_UNSPECIFIED = 0;
+
+  // READ_MODE_LOCAL returns the latest state already applied on this node. It
+  // does not contact a quorum and may therefore return stale data.
+  READ_MODE_LOCAL = 1;
+
+  // READ_MODE_REVISION returns the value visible at ReadRequest.revision from
+  // this node's retained history. It does not perform a ReadIndex round trip.
+  READ_MODE_REVISION = 2;
+
+  // READ_MODE_LINEARIZABLE uses Raft ReadIndex and waits until this node has
+  // applied the returned log index before reading the local state machine.
+  READ_MODE_LINEARIZABLE = 3;
+}
+
+message PutRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message PutResponse {
+  Record record = 1;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  // record is absent when the key did not exist. Deleting a missing key is an
+  // idempotent successful operation and does not advance the logical revision.
+  Record record = 1;
+}
+
+message ReadRequest {
+  string key = 1;
+  ReadMode mode = 2;
+
+  // revision must be greater than zero exactly when mode is
+  // READ_MODE_REVISION, and must be zero for all other modes.
+  uint64 revision = 3;
+}
+
+message ReadResponse {
+  Record record = 1;
+
+  // mode is the normalized mode actually used by the server. In particular,
+  // an unspecified request is returned as READ_MODE_LINEARIZABLE.
+  ReadMode mode = 2;
+
+  // requested_revision is set only for READ_MODE_REVISION.
+  uint64 requested_revision = 3;
+}
+
+message Record {
+  string key = 1;
+  string value = 2;
+  uint64 create_revision = 3;
+  uint64 mod_revision = 4;
+  uint64 version = 5;
+  bool deleted = 6;
+}
+
+message AddMemberRequest {
+  uint64 member_id = 1;
+  string raft_url = 2;
+}
+
+message RemoveMemberRequest {
+  uint64 member_id = 1;
+}
+
+message MemberChangeResponse {
+  bool accepted = 1;
+}
