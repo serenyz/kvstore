@@ -29,7 +29,7 @@ go run ./cmd/kvstore \
 
 ```bash
 grpcurl -plaintext \
-  -d '{"service":"kvstore.v1.KVStore"}' \
+  -d '{"service":"kvstore.KVStore"}' \
   127.0.0.1:9121 grpc.health.v1.Health/Check
 ```
 
@@ -56,15 +56,15 @@ go run ./cmd/kvstore -id=3 -port=9123 \
 
 ## RPC 契约
 
-接口定义位于 [`api/kvstore/v1/kvstore.proto`](api/kvstore/v1/kvstore.proto)。服务端注册以下服务：
+接口定义位于 [`pb/kvstore.proto`](pb/kvstore.proto)。服务端注册以下服务：
 
 | 服务 | RPC | 说明 |
 | --- | --- | --- |
-| `kvstore.v1.KVStore` | `Put` | 复制写入；本节点应用已提交日志后返回 |
-| `kvstore.v1.KVStore` | `Delete` | 复制删除；删除不存在的键是幂等成功 |
-| `kvstore.v1.KVStore` | `Read` | 按 `mode` 执行本地读、版本读或线性一致读 |
-| `kvstore.v1.Cluster` | `AddMember` | 提议增加 Raft 成员 |
-| `kvstore.v1.Cluster` | `RemoveMember` | 提议移除 Raft 成员 |
+| `kvstore.KVStore` | `Put` | 复制写入；本节点应用已提交日志后返回 |
+| `kvstore.KVStore` | `Delete` | 复制删除；删除不存在的键是幂等成功 |
+| `kvstore.KVStore` | `Read` | 按 `mode` 执行本地读、版本读或线性一致读 |
+| `kvstore.Cluster` | `AddMember` | 提议增加 Raft 成员 |
+| `kvstore.Cluster` | `RemoveMember` | 提议移除 Raft 成员 |
 
 键最大为 4096 字节，值最大为 4 MiB。键和值都是 protobuf `string`，应使用有效的 UTF-8 文本。
 
@@ -73,7 +73,7 @@ go run ./cmd/kvstore -id=3 -port=9123 \
 ```bash
 grpcurl -plaintext \
   -d '{"key":"theme","value":"dark"}' \
-  127.0.0.1:9121 kvstore.v1.KVStore/Put
+  127.0.0.1:9121 kvstore.KVStore/Put
 ```
 
 示例响应：
@@ -106,7 +106,7 @@ protobuf JSON 会把 `uint64` 显示为字符串；Go 客户端中对应字段�
 ```bash
 grpcurl -plaintext \
   -d '{"key":"theme"}' \
-  127.0.0.1:9121 kvstore.v1.KVStore/Delete
+  127.0.0.1:9121 kvstore.KVStore/Delete
 ```
 
 存在的键会生成墓碑记录并推进逻辑版本。删除不存在或已经删除的键不会生成新版本，响应中的 `record` 为空。
@@ -126,7 +126,7 @@ grpcurl -plaintext \
 ```bash
 grpcurl -plaintext \
   -d '{"key":"theme","mode":"READ_MODE_LOCAL"}' \
-  127.0.0.1:9122 kvstore.v1.KVStore/Read
+  127.0.0.1:9122 kvstore.KVStore/Read
 ```
 
 本地读不会发起 `ReadIndex`。Follower 尚未应用最新提交日志时可能返回旧值，但在节点与多数派失联时仍可能成功。
@@ -140,7 +140,7 @@ grpcurl -plaintext \
     "mode":"READ_MODE_REVISION",
     "revision":"2"
   }' \
-  127.0.0.1:9122 kvstore.v1.KVStore/Read
+  127.0.0.1:9122 kvstore.KVStore/Read
 ```
 
 版本读要求 `revision > 0`。查询会返回在该全局逻辑版本上最后可见的键记录，而不要求该键正好在该版本发生修改。例如键在版本 2 写入、版本 5 更新，则查询版本 3 或 4 都返回版本 2 的记录。
@@ -154,7 +154,7 @@ grpcurl -plaintext \
 ```bash
 grpcurl -plaintext -max-time 3 \
   -d '{"key":"theme","mode":"READ_MODE_LINEARIZABLE"}' \
-  127.0.0.1:9122 kvstore.v1.KVStore/Read
+  127.0.0.1:9122 kvstore.KVStore/Read
 ```
 
 也可以省略 `mode`，服务端默认执行相同的线性一致读取：
@@ -162,7 +162,7 @@ grpcurl -plaintext -max-time 3 \
 ```bash
 grpcurl -plaintext -max-time 3 \
   -d '{"key":"theme"}' \
-  127.0.0.1:9122 kvstore.v1.KVStore/Read
+  127.0.0.1:9122 kvstore.KVStore/Read
 ```
 
 服务端通过 Raft `ReadIndex` 获取安全读取索引，再等待本节点的应用水位达到该索引后查询状态机。服务端默认最多等待 5 秒；客户端应同时设置符合业务要求的、更短或相等的 deadline。
@@ -281,7 +281,7 @@ sequenceDiagram
 ```bash
 grpcurl -plaintext \
   -d '{"memberId":"3","raftUrl":"http://127.0.0.1:9023"}' \
-  127.0.0.1:9121 kvstore.v1.Cluster/AddMember
+  127.0.0.1:9121 kvstore.Cluster/AddMember
 ```
 
 移除成员：
@@ -289,7 +289,7 @@ grpcurl -plaintext \
 ```bash
 grpcurl -plaintext \
   -d '{"memberId":"3"}' \
-  127.0.0.1:9121 kvstore.v1.Cluster/RemoveMember
+  127.0.0.1:9121 kvstore.Cluster/RemoveMember
 ```
 
 `accepted: true` 只表示本地 `raft.Node` 接受了配置变更提案，不表示配置日志已经由多数派提交。
@@ -312,7 +312,7 @@ grpcurl -plaintext \
 protoc \
   --go_out=. --go_opt=paths=source_relative \
   --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-  api/kvstore/v1/kvstore.proto
+  pb/kvstore.proto
 ```
 
 生成文件为 `kvstore.pb.go` 和 `kvstore_grpc.pb.go`，不要手工修改。
